@@ -148,9 +148,13 @@ def init_db() -> None:
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("pickup_1", DEFAULT_PICKUP_POINTS[0]))
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("pickup_2", DEFAULT_PICKUP_POINTS[1]))
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("manager_url", DEFAULT_MANAGER_URL))
-    env_channel = os.getenv("CHANNEL_CHAT_ID", "").strip()
+    env_channel = os.getenv("CHANNEL_CHAT_ID", "-79384826402979").strip()
     if env_channel:
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("channel_chat_id", env_channel))
+    cur.execute(
+        "INSERT OR IGNORE INTO admins (user_id, name, added_at) VALUES (?, ?, ?)",
+        (24725732, "Елизавета", "2026-11-02 23:24:00"),
+    )
     conn.commit()
     conn.close()
 
