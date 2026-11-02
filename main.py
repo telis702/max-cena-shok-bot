@@ -1516,6 +1516,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
+    logger.info("Запущена версия v5: мгновенные уведомления о брони + чистый пост в канале")
 
     # Возвращаем зависшую бронь #1 (Пылесос автомобильный) и обновляем активные посты без строки доставки
     if get_setting("notified_v5_instant_book_alert", "0") != "1":
