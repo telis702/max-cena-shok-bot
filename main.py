@@ -559,6 +559,28 @@ async def reserve_product_for_user(
     conn.close()
 
     await sync_channel_product_post(bot, product_id)
+
+    # Мгновенное уведомление администраторам о новой брони в корзину
+    admin_book_text = (
+        f"🛒 **НОВАЯ БРОНЬ В КАНАЛЕ «Цена ШОК»!**\n\n"
+        f"👤 **Покупатель:** {user_name} (ID `{user_id}`)\n"
+        f"📦 **Товар:** **{title}** — {qty_to_add} шт. × {price} руб. = **{qty_to_add * price} руб.**\n"
+        f"📊 **Осталось в канале:** {new_avail} шт.\n\n"
+        "⏳ Товар добавлен в корзину покупателя (ожидает выбора других товаров и оформления доставки/самовывоза).\n"
+        "Если покупатель передумал, вы можете сразу вернуть товар в канал кнопкой ниже:"
+    )
+    admin_book_btns = [
+        [
+            {
+                "type": "callback",
+                "text": f"🔄 Снять бронь и вернуть «{title[:18]}» в канал",
+                "payload": f"adm_unbook:{user_id}:{product_id}",
+            }
+        ]
+    ]
+    for adm_id in get_all_admins():
+        await bot.send_message(text=admin_book_text, user_id=adm_id, buttons=admin_book_btns)
+
     return None
 
 
@@ -662,26 +684,6 @@ async def handle_booking_trigger(
         return
 
     if avail_qty == 1:
-        # Сначала проверяем, открыт ли у покупателя диалог с ботом
-        if callback_id:
-            test_dm = await bot.send_message(
-                text=f"⏳ Бронируем для вас товар **«{title}»** (1 шт. — **{price} руб.**)...",
-                user_id=user_id,
-            )
-            if test_dm is None:
-                # У подписчика ещё не запущен диалог с ботом (dialog.not.found) — не удаляем пост раньше времени!
-                set_setting(f"pending_book_{user_id}", str(product_id))
-                USER_STATES[user_id] = {
-                    "state": "await_book_qty",
-                    "product_id": product_id,
-                    "user_name": user_name,
-                }
-                await bot.answer_callback(
-                    callback_id,
-                    f"👉 Нажмите кнопку «🛍 Моя корзина» под этим постом и нажмите «Начать» в боте, чтобы забронировать «{title}»!",
-                )
-                return
-
         err = await reserve_product_for_user(bot, user_id, user_name, product_id, 1)
         if err:
             if callback_id:
@@ -692,13 +694,12 @@ async def handle_booking_trigger(
         if callback_id:
             await bot.answer_callback(
                 callback_id,
-                f"✅ «{title}» (1 шт.) добавлен в вашу корзину! Перейдите в чат с ботом «Цена шок» для оформления.",
+                f"✅ «{title}» (1 шт.) забронирован в вашу корзину! Откройте бот @id631100036329_1_bot для оформления заказа.",
             )
-        else:
-            await bot.send_message(
-                text=f"✅ Товар **«{title}»** (1 шт. — **{price} руб.**) забронирован и добавлен в вашу корзину!",
-                user_id=user_id,
-            )
+        await bot.send_message(
+            text=f"✅ Товар **«{title}»** (1 шт. — **{price} руб.**) забронирован и добавлен в вашу корзину!",
+            user_id=user_id,
+        )
         await show_user_cart(bot, user_id)
     else:
         set_setting(f"pending_book_{user_id}", str(product_id))
@@ -1144,6 +1145,18 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             )
             return
 
+        if payload.startswith("adm_unbook:") and is_admin(user_id):
+            _, buyer_s, pid_s = payload.split(":")
+            buyer_id, pid = int(buyer_s), int(pid_s)
+            msg = await return_product_from_cart(bot, buyer_id, pid)
+            if msg:
+                await bot.answer_callback(cb_id, "Бронь снята, товар возвращён в канал!")
+                await bot.send_message(f"✅ {msg}", user_id=user_id)
+            else:
+                await bot.answer_callback(cb_id, "Эта бронь уже была снята или оформлена в заказ.")
+                await bot.send_message("ℹ️ Эта бронь уже была снята или переведена в оформленные заказы.", user_id=user_id)
+            return
+
         if payload.startswith("adm_ret1:") and is_admin(user_id):
             pid = int(payload.split(":", 1)[1])
             conn = sqlite3.connect(DB_PATH)
@@ -1505,8 +1518,8 @@ async def main() -> None:
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
 
     # Возвращаем зависшую бронь #1 (Пылесос автомобильный) и обновляем активные посты без строки доставки
-    if get_setting("notified_v4_restore_vacuum", "0") != "1":
-        set_setting("notified_v4_restore_vacuum", "1")
+    if get_setting("notified_v5_instant_book_alert", "0") != "1":
+        set_setting("notified_v5_instant_book_alert", "1")
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT product_id, qty FROM cart_items")
