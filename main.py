@@ -317,9 +317,7 @@ class MaxBotClient:
         callback_id: str,
         notification: Optional[str] = None,
     ) -> None:
-        body: Dict[str, Any] = {}
-        if notification:
-            body["notification"] = notification
+        body: Dict[str, Any] = {"notification": notification if notification else "✅ Выполнено"}
         await self.request("POST", "/answers", params={"callback_id": callback_id}, json_body=body)
 
     async def detect_channel_id(self) -> int:
