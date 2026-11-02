@@ -662,28 +662,46 @@ async def handle_booking_trigger(
         return
 
     if avail_qty == 1:
+        # Сначала проверяем, открыт ли у покупателя диалог с ботом
+        if callback_id:
+            test_dm = await bot.send_message(
+                text=f"⏳ Бронируем для вас товар **«{title}»** (1 шт. — **{price} руб.**)...",
+                user_id=user_id,
+            )
+            if test_dm is None:
+                # У подписчика ещё не запущен диалог с ботом (dialog.not.found) — не удаляем пост раньше времени!
+                set_setting(f"pending_book_{user_id}", str(product_id))
+                USER_STATES[user_id] = {
+                    "state": "await_book_qty",
+                    "product_id": product_id,
+                    "user_name": user_name,
+                }
+                await bot.answer_callback(
+                    callback_id,
+                    f"👉 Нажмите кнопку «🛍 Моя корзина» под этим постом и нажмите «Начать» в боте, чтобы забронировать «{title}»!",
+                )
+                return
+
         err = await reserve_product_for_user(bot, user_id, user_name, product_id, 1)
         if err:
             if callback_id:
                 await bot.answer_callback(callback_id, err)
             await bot.send_message(f"⚠️ {err}", user_id=user_id)
             return
+        set_setting(f"pending_book_{user_id}", "")
         if callback_id:
             await bot.answer_callback(
                 callback_id,
-                f"✅ «{title}» (1 шт.) добавлен в вашу корзину! Нажмите «Моя корзина» для оформления.",
+                f"✅ «{title}» (1 шт.) добавлен в вашу корзину! Перейдите в чат с ботом «Цена шок» для оформления.",
             )
-        await bot.send_message(
-            text=f"✅ Товар **«{title}»** (1 шт. — **{price} руб.**) забронирован и добавлен в вашу корзину!",
-            user_id=user_id,
-        )
+        else:
+            await bot.send_message(
+                text=f"✅ Товар **«{title}»** (1 шт. — **{price} руб.**) забронирован и добавлен в вашу корзину!",
+                user_id=user_id,
+            )
         await show_user_cart(bot, user_id)
     else:
-        if callback_id:
-            await bot.answer_callback(
-                callback_id,
-                f"📩 Перейдите в чат с ботом (кнопка «Моя корзина»), чтобы выбрать количество товара «{title}»!",
-            )
+        set_setting(f"pending_book_{user_id}", str(product_id))
         USER_STATES[user_id] = {
             "state": "await_book_qty",
             "product_id": product_id,
@@ -700,7 +718,7 @@ async def handle_booking_trigger(
             )
         rows.append([{"type": "callback", "text": "🛍 Открыть мою корзину", "payload": "open_cart"}])
 
-        await bot.send_message(
+        sent_prompt = await bot.send_message(
             text=(
                 f"🛒 Вы выбрали товар: **{title}**\n"
                 f"💰 Цена: **{price} руб./шт.** | 📦 Доступно в наличии: **{avail_qty} шт.**\n\n"
@@ -709,6 +727,17 @@ async def handle_booking_trigger(
             user_id=user_id,
             buttons=rows,
         )
+        if callback_id:
+            if sent_prompt is None:
+                await bot.answer_callback(
+                    callback_id,
+                    f"👉 Нажмите кнопку «🛍 Моя корзина» под этим постом и нажмите «Начать» в боте для выбора количества «{title}»!",
+                )
+            else:
+                await bot.answer_callback(
+                    callback_id,
+                    f"📩 Откройте чат с ботом (кнопка «Моя корзина»), чтобы выбрать количество товара «{title}»!",
+                )
 
 
 async def finish_checkout(
@@ -879,6 +908,11 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 return
             except ValueError:
                 pass
+        saved_pending = get_setting(f"pending_book_{user_id}", "")
+        if saved_pending.isdigit():
+            set_setting(f"pending_book_{user_id}", "")
+            await handle_booking_trigger(bot, user_id, user_name, int(saved_pending))
+            return
         pending = USER_STATES.get(user_id, {})
         if pending.get("state") == "await_book_qty" and pending.get("product_id"):
             await handle_booking_trigger(bot, user_id, user_name, int(pending["product_id"]))
@@ -1052,6 +1086,10 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             cur = conn.cursor()
             cur.execute("SELECT id, title, price, available_qty, total_qty FROM products ORDER BY id DESC LIMIT 15")
             rows = cur.fetchall()
+            cur.execute(
+                "SELECT c.user_name, p.title, c.qty FROM cart_items c JOIN products p ON p.id = c.product_id ORDER BY c.id DESC"
+            )
+            cart_rows = cur.fetchall()
             conn.close()
             if not rows:
                 await bot.send_message("Товаров пока нет.", user_id=user_id)
@@ -1069,7 +1107,41 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                         }
                     ]
                 )
+            if cart_rows:
+                lines.append("\n🛒 **Сейчас лежит в корзинах (ещё не оформлено):**")
+                for bname, ptitle, cqty in cart_rows:
+                    lines.append(f"• {bname}: **{ptitle}** ({cqty} шт.)")
+                btns.append(
+                    [
+                        {
+                            "type": "callback",
+                            "text": "🔄 Снять бронь из корзин и вернуть все в канал",
+                            "payload": "adm:clear_all_carts",
+                        }
+                    ]
+                )
             await bot.send_message("\n".join(lines), user_id=user_id, buttons=btns)
+            return
+
+        if payload == "adm:clear_all_carts" and is_admin(user_id):
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT product_id, qty FROM cart_items")
+            c_rows = cur.fetchall()
+            cur.execute("DELETE FROM cart_items")
+            pids_to_sync = set()
+            for pid, qty in c_rows:
+                cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
+                pids_to_sync.add(int(pid))
+            conn.commit()
+            conn.close()
+            for pid in pids_to_sync:
+                await sync_channel_product_post(bot, pid)
+            await bot.answer_callback(cb_id, "Неоформленные корзины очищены, товары возвращены в канал!")
+            await bot.send_message(
+                "✅ Все неоформленные брони из корзин сняты, товары снова опубликованы в канале «Цена ШОК»!",
+                user_id=user_id,
+            )
             return
 
         if payload.startswith("adm_ret1:") and is_admin(user_id):
@@ -1432,12 +1504,18 @@ async def main() -> None:
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
 
-    # Обновляем активные посты в канале (без строки доставки под постом) и отправляем обновлённое меню админу
-    if get_setting("notified_v3_clean_post", "0") != "1":
-        set_setting("notified_v3_clean_post", "1")
+    # Возвращаем зависшую бронь #1 (Пылесос автомобильный) и обновляем активные посты без строки доставки
+    if get_setting("notified_v4_restore_vacuum", "0") != "1":
+        set_setting("notified_v4_restore_vacuum", "1")
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0 AND channel_message_id IS NOT NULL")
+        cur.execute("SELECT product_id, qty FROM cart_items")
+        stuck_carts = cur.fetchall()
+        cur.execute("DELETE FROM cart_items")
+        for pid, qty in stuck_carts:
+            cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
+        conn.commit()
+        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0")
         active_pids = [r[0] for r in cur.fetchall()]
         conn.close()
         for pid in active_pids:
