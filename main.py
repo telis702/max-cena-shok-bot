@@ -338,12 +338,10 @@ def build_channel_post_text(product_id: int, title: str, price: int, available_q
         if available_qty > 1
         else "📦 **В наличии:** 1 шт. (последний экземпляр!)"
     )
-    free_min = get_setting("free_delivery_min", "1000")
     return (
         f"🔥 **{title}**\n\n"
         f"💰 **Цена:** **{price} руб.**\n"
         f"{qty_line}\n\n"
-        f"🚚 Бесплатная доставка от {free_min} руб. | 📍 Самовывоз — от любой суммы\n"
         f"👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
     )
 
@@ -603,19 +601,31 @@ async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> None:
 # =====================================================================
 # АДМИН-ПАНЕЛЬ
 # =====================================================================
+def get_open_delivery_dates() -> List[str]:
+    raw = get_setting("delivery_dates", "").strip()
+    if not raw or raw in ("0", "нет", "-"):
+        return []
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    return parts[:8]
+
+
 async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
     free_min = get_setting("free_delivery_min", "1000")
     ch_id = await bot.detect_channel_id()
+    open_dates = get_open_delivery_dates()
+    dates_status = ", ".join(open_dates) if open_dates else "По согласованию с менеджером"
 
     text = (
         "⚙️ **Панель управления магазином «Цена ШОК»**\n\n"
         f"📢 **Канал MAX:** ✅ Подключён («Цена ШОК», `{ch_id}`)\n"
         f"🚚 **Бесплатная доставка:** от **{free_min} руб.**\n"
+        f"📅 **Даты доставки:** {dates_status}\n"
         "📍 **Самовывоз:** от любой суммы (адрес по связи с менеджером)\n\n"
         "Выберите действие:"
     )
     buttons = [
         [{"type": "callback", "text": "➕ Выложить новый товар в канал", "payload": "adm:new_prod"}],
+        [{"type": "callback", "text": "📅 Открыть / изменить даты доставки", "payload": "adm:set_deliv_dates"}],
         [{"type": "callback", "text": "📦 Товары и остатки", "payload": "adm:list_prods"}],
         [{"type": "callback", "text": "📋 Заказы покупателей (и возврат в канал)", "payload": "adm:orders"}],
         [{"type": "callback", "text": "🚚 Изменить порог бесплатной доставки", "payload": "adm:set_free_min"}],
@@ -943,15 +953,35 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     )
                     return
                 await bot.answer_callback(cb_id)
+                open_dates = get_open_delivery_dates()
+                if open_dates:
+                    date_btns = [
+                        [{"type": "callback", "text": f"📅 {d}", "payload": f"deliv_date:{idx}"}]
+                        for idx, d in enumerate(open_dates)
+                    ]
+                    date_btns.append(
+                        [{"type": "callback", "text": "💬 Согласовать дату с менеджером", "payload": "deliv_date:manager"}]
+                    )
+                    await bot.send_message(
+                        text=(
+                            "🚚 **Запись на бесплатную доставку**\n\n"
+                            "Выберите удобную дату доставки на кнопке ниже:"
+                        ),
+                        user_id=user_id,
+                        buttons=date_btns,
+                    )
+                    return
+
                 USER_STATES[user_id] = {
                     "state": "await_delivery_address",
                     "user_name": user_name,
                     "user_username": user_username,
+                    "chosen_date": "по согласованию с менеджером",
                 }
                 await bot.send_message(
                     text=(
                         "🚚 **Оформление бесплатной доставки**\n\n"
-                        "Напишите в ответном сообщении **ваш точный адрес доставки и номер телефона для связи**:"
+                        "Напишите в ответном сообщении **ваш точный адрес доставки и номер телефона для связи** (дату и время согласуем с менеджером):"
                     ),
                     user_id=user_id,
                 )
@@ -971,6 +1001,29 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     user_id=user_id,
                 )
                 return
+
+        if payload.startswith("deliv_date:"):
+            val = payload.split(":", 1)[1]
+            open_dates = get_open_delivery_dates()
+            if val == "manager" or not val.isdigit() or int(val) >= len(open_dates):
+                chosen_date = "по согласованию с менеджером"
+            else:
+                chosen_date = open_dates[int(val)]
+            await bot.answer_callback(cb_id, f"Выбрана дата: {chosen_date}")
+            USER_STATES[user_id] = {
+                "state": "await_delivery_address",
+                "user_name": user_name,
+                "user_username": user_username,
+                "chosen_date": chosen_date,
+            }
+            await bot.send_message(
+                text=(
+                    f"📅 Выбрана доставка: **{chosen_date}**\n\n"
+                    "Напишите в ответном сообщении **ваш точный адрес доставки и номер телефона для связи**:"
+                ),
+                user_id=user_id,
+            )
+            return
 
         if payload == "adm:new_prod" and is_admin(user_id):
             await bot.answer_callback(cb_id)
@@ -1097,6 +1150,40 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             )
             return
 
+        if payload == "adm:set_deliv_dates" and is_admin(user_id):
+            await bot.answer_callback(cb_id)
+            USER_STATES[user_id] = {"state": "adm_await_deliv_dates"}
+            await bot.send_message(
+                text=(
+                    "📅 **Настройка открытых дат доставки**\n\n"
+                    "Напишите доступные для записи даты и интервалы через запятую (например: `Пт 6 ноября 18:00-21:00, Сб 7 ноября 12:00-16:00`), "
+                    "и покупатели смогут выбирать их по кнопкам при оформлении корзины.\n\n"
+                    "Или нажмите кнопку ниже, чтобы дата доставки согласовывалась лично с вами (менеджером):"
+                ),
+                user_id=user_id,
+                buttons=[
+                    [
+                        {
+                            "type": "callback",
+                            "text": "💬 Согласовывать лично с менеджером (без кнопок дат)",
+                            "payload": "adm:clear_deliv_dates",
+                        }
+                    ]
+                ],
+            )
+            return
+
+        if payload == "adm:clear_deliv_dates" and is_admin(user_id):
+            set_setting("delivery_dates", "")
+            USER_STATES.pop(user_id, None)
+            await bot.answer_callback(cb_id, "Режим: согласование даты доставки лично с менеджером")
+            await bot.send_message(
+                "✅ Открытые даты отключены. Теперь при оформлении доставки время согласуется лично с менеджером.",
+                user_id=user_id,
+            )
+            await show_admin_menu(bot, user_id)
+            return
+
     if utype == "message_created":
         msg = upd.get("message", {})
         recipient = msg.get("recipient", {})
@@ -1156,6 +1243,8 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 if len(text) < 4:
                     await bot.send_message("Пожалуйста, укажите адрес доставки и телефон:", user_id=user_id)
                     return
+                chosen_date = st.get("chosen_date", "по согласованию с менеджером")
+                full_delivery_addr = f"{text} (Дата доставки: {chosen_date})"
                 USER_STATES.pop(user_id, None)
                 await finish_checkout(
                     bot,
@@ -1163,7 +1252,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     user_name=user_name,
                     user_username=user_username,
                     delivery_type="delivery",
-                    delivery_address=text,
+                    delivery_address=full_delivery_addr,
                     phone_and_comment=text,
                 )
                 return
@@ -1262,6 +1351,26 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_admin_menu(bot, user_id)
                 return
 
+            if state_name == "adm_await_deliv_dates":
+                if text.strip() in ("0", "-", "нет", "Нет"):
+                    set_setting("delivery_dates", "")
+                    USER_STATES.pop(user_id, None)
+                    await bot.send_message(
+                        "✅ Открытые даты отключены. Теперь дата доставки согласуется лично с менеджером.",
+                        user_id=user_id,
+                    )
+                else:
+                    set_setting("delivery_dates", text.strip())
+                    USER_STATES.pop(user_id, None)
+                    open_dates = get_open_delivery_dates()
+                    await bot.send_message(
+                        f"✅ Открытые даты для записи на доставку сохранены:\n"
+                        + "\n".join([f"• **{d}**" for d in open_dates]),
+                        user_id=user_id,
+                    )
+                await show_admin_menu(bot, user_id)
+                return
+
         await show_user_cart(bot, user_id)
         if is_admin(user_id):
             await show_admin_menu(bot, user_id)
@@ -1322,6 +1431,24 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
+
+    # Обновляем активные посты в канале (без строки доставки под постом) и отправляем обновлённое меню админу
+    if get_setting("notified_v3_clean_post", "0") != "1":
+        set_setting("notified_v3_clean_post", "1")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0 AND channel_message_id IS NOT NULL")
+        active_pids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        for pid in active_pids:
+            try:
+                await sync_channel_product_post(bot, pid)
+            except Exception as e:
+                logger.warning(f"Не удалось обновить пост #{pid}: {e}")
+        try:
+            await show_admin_menu(bot, 24725732)
+        except Exception:
+            pass
 
     marker: Optional[int] = None
     logger.info("Запущен Long Polling обновлений MAX API...")
