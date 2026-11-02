@@ -58,11 +58,12 @@ MAX_BOT_TOKEN = (
 DB_PATH = BASE_DIR / "shop_data.db"
 
 DEFAULT_CHANNEL_CHAT_ID = -79384826402979
-DEFAULT_FREE_DELIVERY = int(os.getenv("FREE_DELIVERY_THRESHOLD", "1000"))
+DEFAULT_FREE_DELIVERY = int(os.getenv("FREE_DELIVERY_THRESHOLD", "1500"))
 DEFAULT_MANAGER_URL = os.getenv(
     "MANAGER_URL",
     "https://max.ru/u/f9LHodD0cOLwisaQT6OasJIhpM99nL8Pt9p-0FTvXvQrqhzv4wLKzzkPLzk",
 )
+SUPER_ADMIN_IDS = {24725732, 11879587}
 
 
 # =====================================================================
@@ -171,6 +172,8 @@ def set_setting(key: str, value: str) -> None:
 
 
 def is_admin(user_id: int) -> bool:
+    if user_id in SUPER_ADMIN_IDS:
+        return True
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
@@ -194,9 +197,9 @@ def get_all_admins() -> List[int]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM admins")
-    rows = [r[0] for r in cur.fetchall()]
+    rows = {r[0] for r in cur.fetchall()} | SUPER_ADMIN_IDS
     conn.close()
-    return rows
+    return list(rows)
 
 
 # =====================================================================
@@ -454,7 +457,7 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
     summary = get_cart_summary(user_id)
     items = summary["items"]
     total = summary["total"]
-    free_min = int(get_setting("free_delivery_min", "1000"))
+    free_min = int(get_setting("free_delivery_min", "1500"))
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
 
     if not items:
@@ -632,7 +635,7 @@ def get_open_delivery_dates() -> List[str]:
 
 
 async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
-    free_min = get_setting("free_delivery_min", "1000")
+    free_min = get_setting("free_delivery_min", "1500")
     ch_id = await bot.detect_channel_id()
     open_dates = get_open_delivery_dates()
     dates_status = ", ".join(open_dates) if open_dates else "По согласованию с менеджером"
@@ -976,7 +979,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if payload.startswith("checkout:"):
             mode = payload.split(":", 1)[1]
             summary = get_cart_summary(user_id)
-            free_min = int(get_setting("free_delivery_min", "1000"))
+            free_min = int(get_setting("free_delivery_min", "1500"))
             if not summary["items"]:
                 await bot.answer_callback(cb_id, "Корзина пуста")
                 return
@@ -1229,10 +1232,34 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if payload == "adm:set_free_min" and is_admin(user_id):
             await bot.answer_callback(cb_id)
             USER_STATES[user_id] = {"state": "adm_await_free_min"}
+            cur_min = get_setting("free_delivery_min", "1500")
             await bot.send_message(
-                "Введите новую минимальную сумму заказа для бесплатной доставки (в рублях, например `1000`):",
+                text=(
+                    f"🚚 **Настройка порога бесплатной доставки** (сейчас: **от {cur_min} руб.**)\n\n"
+                    "Выберите готовую сумму кнопкой ниже или **напишите любое число в рублях** в ответном сообщении (например `1500`):"
+                ),
                 user_id=user_id,
+                buttons=[
+                    [
+                        {"type": "callback", "text": "1000 руб.", "payload": "adm_free_val:1000"},
+                        {"type": "callback", "text": "1500 руб.", "payload": "adm_free_val:1500"},
+                        {"type": "callback", "text": "2000 руб.", "payload": "adm_free_val:2000"},
+                    ],
+                    [
+                        {"type": "callback", "text": "2500 руб.", "payload": "adm_free_val:2500"},
+                        {"type": "callback", "text": "3000 руб.", "payload": "adm_free_val:3000"},
+                    ],
+                ],
             )
+            return
+
+        if payload.startswith("adm_free_val:") and is_admin(user_id):
+            val = payload.split(":", 1)[1].strip()
+            set_setting("free_delivery_min", val)
+            USER_STATES.pop(user_id, None)
+            await bot.answer_callback(cb_id, f"Бесплатная доставка: от {val} руб.")
+            await bot.send_message(f"✅ Порог бесплатной доставки обновлён: **от {val} руб.**", user_id=user_id)
+            await show_admin_menu(bot, user_id)
             return
 
         if payload == "adm:set_deliv_dates" and is_admin(user_id):
@@ -1456,6 +1483,17 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_admin_menu(bot, user_id)
                 return
 
+        if is_admin(user_id):
+            only_digits = "".join(ch for ch in text if ch.isdigit())
+            if only_digits and (text.strip().isdigit() or "достав" in text.lower()) and int(only_digits) >= 100:
+                set_setting("free_delivery_min", only_digits)
+                await bot.send_message(
+                    f"✅ Порог бесплатной доставки обновлён: **от {only_digits} руб.**",
+                    user_id=user_id,
+                )
+                await show_admin_menu(bot, user_id)
+                return
+
         await show_user_cart(bot, user_id)
         if is_admin(user_id):
             await show_admin_menu(bot, user_id)
@@ -1516,11 +1554,12 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v5: мгновенные уведомления о брони + чистый пост в канале")
+    logger.info("Запущена версия v6: бесплатная доставка от 1500 руб + кнопки быстрой смены порога")
 
-    # Возвращаем зависшую бронь #1 (Пылесос автомобильный) и обновляем активные посты без строки доставки
-    if get_setting("notified_v5_instant_book_alert", "0") != "1":
-        set_setting("notified_v5_instant_book_alert", "1")
+    # Устанавливаем порог 1500 руб., возвращаем зависшие неоформленные корзины и обновляем активные посты
+    if get_setting("notified_v6_free_1500", "0") != "1":
+        set_setting("notified_v6_free_1500", "1")
+        set_setting("free_delivery_min", "1500")
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT product_id, qty FROM cart_items")
@@ -1538,6 +1577,10 @@ async def main() -> None:
             except Exception as e:
                 logger.warning(f"Не удалось обновить пост #{pid}: {e}")
         try:
+            await bot.send_message(
+                "✅ Порог бесплатной доставки обновлён: **от 1500 руб.**",
+                user_id=24725732,
+            )
             await show_admin_menu(bot, 24725732)
         except Exception:
             pass
