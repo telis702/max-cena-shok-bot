@@ -14,20 +14,18 @@
    - Если товара несколько шт. -> выбор/ввод желаемого количества, списание из остатка, обновление поста в канале (и снятие поста при остатке 0).
 4. Корзина покупателя + расчёт доставки и самовывоза:
    - Бесплатная доставка от 1 000 руб. (если сумма меньше — бот пишет, сколько осталось добрать до бесплатной доставки).
-   - Самовывоз от любой суммы из 2 точек в Самаре:
-     1) г. Самара, с. Николаевка, ул. Советская, 13
-     2) г. Самара, Внутренний проезд, 45
+   - Кнопка «📍 Самовывоз» от любой суммы (адрес самовывоза уточняется по связи с менеджером).
 5. Автоматический возврат товара обратно в канал при отказе:
    - Если покупатель удаляет позицию из корзины или менеджер нажимает «Отказ / Вернуть в канал» в карточке заказа,
      бот автоматически возвращает количество на остаток и заново публикует/восстанавливает пост товара в канале MAX.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import sqlite3
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,8 +46,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max_shop_bot")
 
-import base64
-
 MAX_API_BASE = "https://platform-api.max.ru"
 _DEFAULT_B64 = "ZjlMSG9kRDBjT0xzWGtJZ3hZTVNGajdjYVlCVzBOUXpQYXJISUNEZTFZRUNtTHFhVlBkUjJPWW5FNVowZ1Bsa0dUN3RmWU5Gbnk5NUhpOXZGbDJM"
 MAX_BOT_TOKEN = (
@@ -61,10 +57,7 @@ MAX_BOT_TOKEN = (
 ).strip()
 DB_PATH = BASE_DIR / "shop_data.db"
 
-DEFAULT_PICKUP_POINTS = [
-    "г. Самара, с. Николаевка, ул. Советская, 13",
-    "г. Самара, Внутренний проезд, 45",
-]
+DEFAULT_CHANNEL_CHAT_ID = -79384826402979
 DEFAULT_FREE_DELIVERY = int(os.getenv("FREE_DELIVERY_THRESHOLD", "1000"))
 DEFAULT_MANAGER_URL = os.getenv(
     "MANAGER_URL",
@@ -145,15 +138,16 @@ def init_db() -> None:
 
     # Инициализация настроек по умолчанию
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("free_delivery_min", str(DEFAULT_FREE_DELIVERY)))
-    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("pickup_1", DEFAULT_PICKUP_POINTS[0]))
-    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("pickup_2", DEFAULT_PICKUP_POINTS[1]))
-    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("manager_url", DEFAULT_MANAGER_URL))
-    env_channel = os.getenv("CHANNEL_CHAT_ID", "-79384826402979").strip()
-    if env_channel:
-        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("channel_chat_id", env_channel))
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("manager_url", DEFAULT_MANAGER_URL))
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("channel_chat_id", str(DEFAULT_CHANNEL_CHAT_ID)))
+    # Администраторы канала «Цена ШОК»: Елизавета (24725732) и владелец канала Елена (11879587)
     cur.execute(
         "INSERT OR IGNORE INTO admins (user_id, name, added_at) VALUES (?, ?, ?)",
         (24725732, "Елизавета", "2026-11-02 23:24:00"),
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO admins (user_id, name, added_at) VALUES (?, ?, ?)",
+        (11879587, "Елена", "2026-11-02 23:24:00"),
     )
     conn.commit()
     conn.close()
@@ -213,8 +207,8 @@ class MaxBotClient:
         self.token = token
         self.session: Optional[aiohttp.ClientSession] = None
         self.bot_id: Optional[int] = None
-        self.bot_username: str = ""
-        self.bot_name: str = ""
+        self.bot_username: str = "id631100036329_1_bot"
+        self.bot_name: str = "Цена шок"
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -226,7 +220,7 @@ class MaxBotClient:
             self.bot_username = me.get("username", "id631100036329_1_bot")
             self.bot_name = me.get("name", "Цена шок")
             logger.info(f"Бот авторизован: {self.bot_name} (@{self.bot_username}, ID={self.bot_id})")
-        # Очищаем старые вебхуки (например, botman.pro), чтобы они не перехватывали обновления Long Polling
+        # Очищаем сторонние вебхуки, чтобы работал Long Polling
         subs = await self.request("GET", "/subscriptions")
         if subs and subs.get("subscriptions"):
             for sub in subs["subscriptions"]:
@@ -328,21 +322,13 @@ class MaxBotClient:
             body["notification"] = notification
         await self.request("POST", "/answers", params={"callback_id": callback_id}, json_body=body)
 
-    async def detect_channel_id(self) -> Optional[int]:
-        saved = get_setting("channel_chat_id", "")
-        if saved:
-            try:
-                return int(saved)
-            except ValueError:
-                pass
-        ch_link = os.getenv("CHANNEL_LINK", "id631100036329_biz2").strip()
-        ch_resp = await self.request("GET", f"/chats/{ch_link}")
-        if ch_resp and ch_resp.get("chat_id"):
-            ch_id = int(ch_resp["chat_id"])
-            set_setting("channel_chat_id", str(ch_id))
-            logger.info(f"Автоматически определён канал {ch_link}: chat_id={ch_id}")
-            return ch_id
-        return None
+    async def detect_channel_id(self) -> int:
+        saved = get_setting("channel_chat_id", str(DEFAULT_CHANNEL_CHAT_ID))
+        try:
+            return int(saved)
+        except ValueError:
+            set_setting("channel_chat_id", str(DEFAULT_CHANNEL_CHAT_ID))
+            return DEFAULT_CHANNEL_CHAT_ID
 
 
 # =====================================================================
@@ -359,7 +345,7 @@ def build_channel_post_text(product_id: int, title: str, price: int, available_q
         f"🔥 **{title}**\n\n"
         f"💰 **Цена:** **{price} руб.**\n"
         f"{qty_line}\n\n"
-        f"🚚 Бесплатная доставка от {free_min} руб. | 📍 Самовывоз (Самара) — от любой суммы\n"
+        f"🚚 Бесплатная доставка от {free_min} руб. | 📍 Самовывоз — от любой суммы\n"
         f"👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
     )
 
@@ -367,7 +353,6 @@ def build_channel_post_text(product_id: int, title: str, price: int, available_q
 def build_channel_post_buttons(bot_username: str, product_id: int) -> List[List[Dict[str, Any]]]:
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
     cart_url = f"https://max.ru/{bot_username}?start=cart" if bot_username else manager_url
-    # Используем callback-кнопку для мгновенной брони + диплинк-кнопку «Моя корзина» и «Связь с менеджером»
     buttons: List[List[Dict[str, Any]]] = [
         [
             {"type": "callback", "text": "🛒 Забронировать", "payload": f"book:{product_id}"},
@@ -381,15 +366,6 @@ def build_channel_post_buttons(bot_username: str, product_id: int) -> List[List[
 
 
 async def sync_channel_product_post(bot: MaxBotClient, product_id: int) -> None:
-    """
-    Синхронизирует состояние поста товара в канале «Цена ШОК»:
-    - Если available_qty <= 0: удаляет пост из канала (чтобы товар больше не бронировали),
-      сохраняя карточку и фото в БД на случай отказа/возврата.
-    - Если available_qty > 0:
-      * если пост уже есть в канале -> обновляет остаток в тексте поста;
-      * если пост был удалён (было 0 шт., а после отказа клиента товар вернулся!) ->
-        АВТОМАТИЧЕСКИ заново публикует карточку товара с фото и кнопками обратно в канал!
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -408,17 +384,14 @@ async def sync_channel_product_post(bot: MaxBotClient, product_id: int) -> None:
         ch_id = await bot.detect_channel_id()
 
     if avail_qty <= 0:
-        # Товар полностью разобран — убираем пост из канала
         if msg_id:
             deleted = await bot.delete_message(msg_id)
             if not deleted:
-                # Если удаление не прошло, меняем плашку на «ЗАБРОНИРОВАНО» без кнопки брони
                 sold_text = f"🔒 **{title}**\n💰 Цена: {price} руб.\n\n⏳ **Товар забронирован!**"
                 await bot.edit_message(msg_id, sold_text, buttons=[], photo_payload=photo_payload)
             cur.execute("UPDATE products SET channel_message_id = NULL WHERE id = ?", (pid,))
             conn.commit()
     else:
-        # Товар в наличии (или вернулся после отказа!)
         post_text = build_channel_post_text(pid, title, price, avail_qty)
         buttons = build_channel_post_buttons(bot.bot_username, pid)
         if msg_id:
@@ -444,7 +417,7 @@ async def sync_channel_product_post(bot: MaxBotClient, product_id: int) -> None:
 
 
 # =====================================================================
-# СОСТОЯНИЯ ДИАЛОГА (FSM В ПАМЯТИ)
+# СОСТОЯНИЯ ДИАЛОГА И КОРЗИНА
 # =====================================================================
 USER_STATES: Dict[int, Dict[str, Any]] = {}
 
@@ -486,8 +459,6 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
     items = summary["items"]
     total = summary["total"]
     free_min = int(get_setting("free_delivery_min", "1000"))
-    pickup_1 = get_setting("pickup_1", DEFAULT_PICKUP_POINTS[0])
-    pickup_2 = get_setting("pickup_2", DEFAULT_PICKUP_POINTS[1])
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
 
     if not items:
@@ -535,18 +506,15 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
         lines.append(
             f"ℹ️ *Бесплатная доставка действует при заказе от {free_min} руб. "
             f"(осталось добрать ещё на **{diff} руб.**).* "
-            f"Сейчас вы можете выбрать **самовывоз** от любой суммы или добрать товары в канале:"
+            f"Сейчас вы можете оформить **самовывоз** от любой суммы или добрать товары в канале:"
         )
 
     buttons.append(
-        [{"type": "callback", "text": f"📍 Самовывоз: с. Николаевка, Советская 13", "payload": "checkout:pickup1"}]
-    )
-    buttons.append(
-        [{"type": "callback", "text": f"📍 Самовывоз: Внутренний проезд, 45", "payload": "checkout:pickup2"}]
+        [{"type": "callback", "text": "📍 Оформить самовывоз", "payload": "checkout:pickup"}]
     )
     buttons.append(
         [
-            {"type": "callback", "text": "🗑 Очистить всю корзину", "payload": "cart_clear"},
+            {"type": "callback", "text": "🗑 Очистить корзину", "payload": "cart_clear"},
             {"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url},
         ]
     )
@@ -565,11 +533,6 @@ async def reserve_product_for_user(
     product_id: int,
     qty_to_add: int,
 ) -> Optional[str]:
-    """
-    Бронирует qty_to_add штук товара product_id за покупателем user_id,
-    уменьшает available_qty и обновляет/скрывает пост в канале.
-    Возвращает текст ошибки или None при успехе.
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT title, price, available_qty FROM products WHERE id = ?", (product_id,))
@@ -604,10 +567,6 @@ async def reserve_product_for_user(
 
 
 async def return_product_from_cart(bot: MaxBotClient, user_id: int, product_id: int) -> Optional[str]:
-    """
-    Удаляет товар из корзины покупателя, возвращает количество на склад
-    и автоматически возвращает/обновляет пост товара в канале MAX.
-    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -648,17 +607,13 @@ async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> None:
 # =====================================================================
 async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
     free_min = get_setting("free_delivery_min", "1000")
-    pickup_1 = get_setting("pickup_1", DEFAULT_PICKUP_POINTS[0])
-    pickup_2 = get_setting("pickup_2", DEFAULT_PICKUP_POINTS[1])
     ch_id = await bot.detect_channel_id()
-    ch_status = f"Подключён (`{ch_id}`)" if ch_id else "Ожидает добавления бота админом в канал"
 
     text = (
         "⚙️ **Панель управления магазином «Цена ШОК»**\n\n"
-        f"📢 **Канал MAX:** {ch_status}\n"
+        f"📢 **Канал MAX:** ✅ Подключён («Цена ШОК», `{ch_id}`)\n"
         f"🚚 **Бесплатная доставка:** от **{free_min} руб.**\n"
-        f"📍 **Самовывоз 1:** {pickup_1}\n"
-        f"📍 **Самовывоз 2:** {pickup_2}\n\n"
+        "📍 **Самовывоз:** от любой суммы (адрес по связи с менеджером)\n\n"
         "Выберите действие:"
     )
     buttons = [
@@ -699,7 +654,6 @@ async def handle_booking_trigger(
         return
 
     if avail_qty == 1:
-        # Если в наличии всего 1 шт. — бронируем сразу без лишнего вопроса!
         err = await reserve_product_for_user(bot, user_id, user_name, product_id, 1)
         if err:
             if callback_id:
@@ -709,7 +663,7 @@ async def handle_booking_trigger(
         if callback_id:
             await bot.answer_callback(
                 callback_id,
-                f"✅ «{title}» (1 шт.) добавлен в вашу корзину! Перейдите в бот для оформления.",
+                f"✅ «{title}» (1 шт.) добавлен в вашу корзину! Нажмите «Моя корзина» для оформления.",
             )
         await bot.send_message(
             text=f"✅ Товар **«{title}»** (1 шт. — **{price} руб.**) забронирован и добавлен в вашу корзину!",
@@ -717,11 +671,10 @@ async def handle_booking_trigger(
         )
         await show_user_cart(bot, user_id)
     else:
-        # В наличии несколько штук — просим выбрать или ввести количество
         if callback_id:
             await bot.answer_callback(
                 callback_id,
-                f"📩 Перейдите в чат с ботом, чтобы указать количество товара «{title}»!",
+                f"📩 Перейдите в чат с ботом (кнопка «Моя корзина»), чтобы выбрать количество товара «{title}»!",
             )
         USER_STATES[user_id] = {
             "state": "await_book_qty",
@@ -787,7 +740,6 @@ async def finish_checkout(
         ),
     )
     order_id = cur.lastrowid
-    # Очищаем корзину (остатки уже списаны в момент брони!)
     cur.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -795,31 +747,35 @@ async def finish_checkout(
     items_text = "\n".join(
         [f"• **{it['title']}** — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**" for it in items]
     )
-    delivery_label = "🚚 Бесплатная доставка" if delivery_type == "delivery" else "📍 Самовывоз"
+    manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
+
+    if delivery_type == "delivery":
+        delivery_info = f"🚚 **Бесплатная доставка:** {delivery_address}"
+    else:
+        delivery_info = "📍 **Способ получения:** Самовывоз (точный адрес по связи с менеджером)"
 
     await bot.send_message(
         text=(
             f"🎉 **Ваш заказ №{order_id} успешно оформлен!**\n\n"
             f"📦 **Состав заказа:**\n{items_text}\n\n"
             f"💰 **Итого:** **{total} руб.**\n"
-            f"{delivery_label}: **{delivery_address}**\n"
+            f"{delivery_info}\n"
             f"📞 Контакт / комментарий: {phone_and_comment}\n\n"
-            "Менеджер уже получил ваш заказ и свяжется с вами в ближайшее время!"
+            "Менеджер уже получил ваш заказ и свяжется с вами (также вы можете написать менеджеру по кнопке ниже):"
         ),
         user_id=user_id,
         buttons=[
+            [{"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url}],
             [{"type": "link", "text": "📢 Вернуться в канал «Цена ШОК»", "url": "https://max.ru/id631100036329_biz2"}],
-            [{"type": "link", "text": "👩‍💼 Написать менеджеру", "url": get_setting("manager_url", DEFAULT_MANAGER_URL)}],
         ],
     )
 
-    # Отправляем уведомление всем администраторам с кнопкой автовозврата товаров в канал при отказе
-    user_link = f"https://max.ru/{user_username}" if user_username else f"max://user/{user_id}"
+    user_link = f"https://max.ru/{user_username}" if user_username else f"ID {user_id}"
     admin_text = (
         f"🔔 **НОВЫЙ ЗАКАЗ №{order_id} («Цена ШОК»)**\n\n"
         f"👤 **Покупатель:** {user_name} ({user_link})\n"
         f"📞 **Телефон / комментарий:** {phone_and_comment}\n"
-        f"{delivery_label}: **{delivery_address}**\n\n"
+        f"{delivery_info}\n\n"
         f"📦 **Товары:**\n{items_text}\n\n"
         f"💰 **Сумма заказа:** **{total} руб.**"
     )
@@ -849,7 +805,10 @@ async def cancel_order_and_restore_to_channel(bot: MaxBotClient, order_id: int, 
     items_json, status, buyer_name = row
     if status == "cancelled":
         conn.close()
-        await bot.send_message(f"Заказ №{order_id} уже был отменён ранее, товары уже возвращены в канал.", user_id=admin_user_id)
+        await bot.send_message(
+            f"Заказ №{order_id} уже был отменён ранее, товары уже возвращены в канал.",
+            user_id=admin_user_id,
+        )
         return
 
     items = json.loads(items_json)
@@ -880,7 +839,6 @@ async def cancel_order_and_restore_to_channel(bot: MaxBotClient, order_id: int, 
 async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
     utype = upd.get("update_type")
 
-    # 0. Бота добавили в канал как администратора (bot_added)
     if utype == "bot_added":
         ch_id = upd.get("chat_id")
         user = upd.get("user", {})
@@ -898,28 +856,12 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             await show_admin_menu(bot, uid)
         return
 
-    # 1. Переход по диплинку (?start=...)
     if utype == "bot_started":
         user = upd.get("user", {})
         user_id = user.get("user_id")
         user_name = user.get("name", "Покупатель")
-        user_username = user.get("username", "")
         payload = (upd.get("payload") or "").strip()
         if not user_id:
-            return
-        if is_admin(user_id) and not get_all_admins():
-            add_admin(user_id, user_name)
-
-        if payload == "manager":
-            USER_STATES[user_id] = {
-                "state": "await_manager_question",
-                "user_name": user_name,
-                "user_username": user_username,
-            }
-            await bot.send_message(
-                "👩‍💼 **Связь с менеджером «Цена ШОК»**\n\nНапишите ваш вопрос и номер телефона в ответном сообщении — менеджер получит его и сразу свяжется с вами:",
-                user_id=user_id,
-            )
             return
 
         if payload.startswith("book_"):
@@ -938,7 +880,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             await show_admin_menu(bot, user_id)
         return
 
-    # 2. Нажатие inline-кнопки (message_callback)
     if utype == "message_callback":
         cb = upd.get("callback", {})
         cb_id = cb.get("callback_id")
@@ -1018,28 +959,21 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
             else:
-                pickup_addr = (
-                    get_setting("pickup_1", DEFAULT_PICKUP_POINTS[0])
-                    if mode == "pickup1"
-                    else get_setting("pickup_2", DEFAULT_PICKUP_POINTS[1])
-                )
                 await bot.answer_callback(cb_id)
                 USER_STATES[user_id] = {
                     "state": "await_pickup_phone",
-                    "pickup_address": pickup_addr,
                     "user_name": user_name,
                     "user_username": user_username,
                 }
                 await bot.send_message(
                     text=(
-                        f"📍 **Выбран пункт самовывоза:**\n**{pickup_addr}**\n\n"
-                        "Напишите в ответном сообщении **ваш номер телефона** (и комментарий к заказу при необходимости):"
+                        "📍 **Оформление самовывоза**\n\n"
+                        "Напишите в ответном сообщении **ваш номер телефона** (адрес самовывоза согласуем по связи с менеджером):"
                     ),
                     user_id=user_id,
                 )
                 return
 
-        # Админские callback-кнопки
         if payload == "adm:new_prod" and is_admin(user_id):
             await bot.answer_callback(cb_id)
             add_admin(user_id, user_name)
@@ -1165,14 +1099,12 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             )
             return
 
-    # 3. Обычное сообщение в чат бота (message_created)
     if utype == "message_created":
         msg = upd.get("message", {})
         recipient = msg.get("recipient", {})
         if recipient.get("chat_type") == "channel":
-            # Сохраняем ID канала, если его ещё не было в настройках
             ch_id = recipient.get("chat_id")
-            if ch_id and not get_setting("channel_chat_id", ""):
+            if ch_id:
                 set_setting("channel_chat_id", str(ch_id))
             return
 
@@ -1204,22 +1136,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if st:
             state_name = st.get("state")
 
-            # Покупатель пишет вопрос менеджеру
-            if state_name == "await_manager_question":
-                USER_STATES.pop(user_id, None)
-                user_link = f"https://max.ru/{user_username}" if user_username else f"max://user/{user_id}"
-                for adm_id in get_all_admins():
-                    await bot.send_message(
-                        f"💬 **Вопрос менеджеру от покупателя {user_name}** ({user_link}):\n\n{text}",
-                        user_id=adm_id,
-                    )
-                await bot.send_message(
-                    "✅ Ваше сообщение передано менеджеру! Мы ответим вам в ближайшее время.",
-                    user_id=user_id,
-                )
-                return
-
-            # Покупатель вводит количество товара вручную
             if state_name == "await_book_qty":
                 try:
                     qty = int(text)
@@ -1238,7 +1154,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_user_cart(bot, user_id)
                 return
 
-            # Покупатель вводит адрес бесплатной доставки
             if state_name == "await_delivery_address":
                 if len(text) < 4:
                     await bot.send_message("Пожалуйста, укажите адрес доставки и телефон:", user_id=user_id)
@@ -1255,12 +1170,10 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
-            # Покупатель вводит телефон для самовывоза
             if state_name == "await_pickup_phone":
                 if len(text) < 4:
                     await bot.send_message("Пожалуйста, укажите ваш номер телефона для связи:", user_id=user_id)
                     return
-                pickup_addr = st.get("pickup_address", DEFAULT_PICKUP_POINTS[0])
                 USER_STATES.pop(user_id, None)
                 await finish_checkout(
                     bot,
@@ -1268,12 +1181,11 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     user_name=user_name,
                     user_username=user_username,
                     delivery_type="pickup",
-                    delivery_address=pickup_addr,
+                    delivery_address="Самовывоз (адрес по связи с менеджером)",
                     phone_and_comment=text,
                 )
                 return
 
-            # Админ добавляет товар: Шаг 1 (фото)
             if state_name == "adm_await_photo":
                 photo_payload = None
                 for att in attachments:
@@ -1296,7 +1208,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     )
                 return
 
-            # Админ добавляет товар: Шаг 2 (название)
             if state_name == "adm_await_title":
                 if not text:
                     await bot.send_message("Введите название и описание товара текстом:", user_id=user_id)
@@ -1309,7 +1220,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
-            # Админ добавляет товар: Шаг 3 (цена)
             if state_name == "adm_await_price":
                 digits = "".join(ch for ch in text if ch.isdigit())
                 if not digits:
@@ -1335,7 +1245,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
-            # Админ добавляет товар: Шаг 4 (количество текстом)
             if state_name == "adm_await_qty":
                 digits = "".join(ch for ch in text if ch.isdigit())
                 if not digits or int(digits) <= 0:
@@ -1355,7 +1264,6 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_admin_menu(bot, user_id)
                 return
 
-        # По умолчанию показываем корзину (и админку, если пишет админ)
         await show_user_cart(bot, user_id)
         if is_admin(user_id):
             await show_admin_menu(bot, user_id)
@@ -1414,7 +1322,8 @@ async def main() -> None:
 
     bot = MaxBotClient(MAX_BOT_TOKEN)
     await bot.start()
-    await bot.detect_channel_id()
+    ch_id = await bot.detect_channel_id()
+    logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
 
     marker: Optional[int] = None
     logger.info("Запущен Long Polling обновлений MAX API...")
