@@ -26,7 +26,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -59,6 +59,7 @@ DB_PATH = BASE_DIR / "shop_data.db"
 
 DEFAULT_CHANNEL_CHAT_ID = -79384826402979
 DEFAULT_FREE_DELIVERY = int(os.getenv("FREE_DELIVERY_THRESHOLD", "1500"))
+CART_EXPIRE_DAYS = 10
 DEFAULT_MANAGER_URL = os.getenv(
     "MANAGER_URL",
     "https://max.ru/u/f9LHodD0cOLwisaQT6OasJIhpM99nL8Pt9p-0FTvXvQrqhzv4wLKzzkPLzk",
@@ -223,14 +224,17 @@ class MaxBotClient:
             self.bot_username = me.get("username", "id631100036329_1_bot")
             self.bot_name = me.get("name", "Цена шок")
             logger.info(f"Бот авторизован: {self.bot_name} (@{self.bot_username}, ID={self.bot_id})")
-        # Очищаем сторонние вебхуки, чтобы работал Long Polling
+        # Очищаем сторонние вебхуки (например botman.pro), чтобы работал Long Polling
+        await self.clear_webhooks()
+
+    async def clear_webhooks(self) -> None:
         subs = await self.request("GET", "/subscriptions")
         if subs and subs.get("subscriptions"):
             for sub in subs["subscriptions"]:
                 sub_url = sub.get("url")
                 if sub_url:
                     await self.request("DELETE", "/subscriptions", params={"url": sub_url})
-                    logger.info(f"Удалён сторонний вебхук: {sub_url}")
+                    logger.info(f"Удалён перехватывающий сторонний вебхук: {sub_url}")
 
     async def close(self) -> None:
         if self.session:
@@ -491,7 +495,10 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
             ]
         )
 
-    lines.append(f"\n💰 **Итого к оплате:** **{total} руб.**\n")
+    lines.append(
+        f"\n💰 **Итого к оплате:** **{total} руб.**\n"
+        f"⏳ *Срок бронирования товара в корзине — {CART_EXPIRE_DAYS} дней (после этого корзина автоматически расформировывается).*\n"
+    )
 
     if total >= free_min:
         lines.append(
@@ -608,19 +615,86 @@ async def return_product_from_cart(bot: MaxBotClient, user_id: int, product_id: 
     return f"Бронь на «{title}» ({qty} шт.) отменена, товар возвращён в канал."
 
 
-async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> None:
+async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> List[str]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT product_id, qty FROM cart_items WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "SELECT c.product_id, c.qty, p.title FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ?",
+        (user_id,),
+    )
     rows = cur.fetchall()
     cur.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
-    for pid, qty in rows:
+    for pid, qty, _ in rows:
         cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
     conn.commit()
     conn.close()
 
-    for pid, _ in rows:
+    restored_list = []
+    for pid, qty, title in rows:
         await sync_channel_product_post(bot, pid)
+        restored_list.append(f"{title} ({qty} шт.)")
+    return restored_list
+
+
+async def expire_old_carts(bot: MaxBotClient) -> None:
+    cutoff_str = (datetime.now() - timedelta(days=CART_EXPIRE_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.id, c.user_id, c.user_name, c.product_id, c.qty, p.title
+        FROM cart_items c
+        JOIN products p ON p.id = c.product_id
+        WHERE c.created_at IS NOT NULL AND c.created_at != '' AND c.created_at <= ?
+        """,
+        (cutoff_str,),
+    )
+    expired = cur.fetchall()
+    if not expired:
+        conn.close()
+        return
+
+    pids_to_sync = set()
+    by_user: Dict[int, Dict[str, Any]] = {}
+    for cid, uid, uname, pid, qty, title in expired:
+        cur.execute("DELETE FROM cart_items WHERE id = ?", (cid,))
+        cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
+        pids_to_sync.add(int(pid))
+        info = by_user.setdefault(int(uid), {"name": uname or "Покупатель", "items": []})
+        info["items"].append(f"• {title} ({qty} шт.)")
+    conn.commit()
+    conn.close()
+
+    for pid in pids_to_sync:
+        try:
+            await sync_channel_product_post(bot, pid)
+        except Exception as e:
+            logger.warning(f"Ошибка возврата товара #{pid} при авто-расформировании: {e}")
+
+    for uid, info in by_user.items():
+        items_str = "\n".join(info["items"])
+        try:
+            await bot.send_message(
+                text=(
+                    f"⏰ **Срок бронирования ({CART_EXPIRE_DAYS} дней) истёк.**\n\n"
+                    f"Ваша корзина была автоматически расформирована, а товары возвращены в канал «Цена ШОК»:\n{items_str}"
+                ),
+                user_id=uid,
+            )
+        except Exception:
+            pass
+        for adm_id in get_all_admins():
+            try:
+                await bot.send_message(
+                    text=(
+                        f"⏰ **Авто-расформирование корзины ({CART_EXPIRE_DAYS} дней):**\n"
+                        f"👤 Покупатель: {info['name']} (ID `{uid}`)\n"
+                        f"📦 Возвращены в канал «Цена ШОК»:\n{items_str}"
+                    ),
+                    user_id=adm_id,
+                )
+            except Exception:
+                pass
 
 
 # =====================================================================
@@ -644,12 +718,14 @@ async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
         "⚙️ **Панель управления магазином «Цена ШОК»**\n\n"
         f"📢 **Канал MAX:** ✅ Подключён («Цена ШОК», `{ch_id}`)\n"
         f"🚚 **Бесплатная доставка:** от **{free_min} руб.**\n"
+        f"⏳ **Срок брони в корзине:** **{CART_EXPIRE_DAYS} дней** (далее авто-расформирование)\n"
         f"📅 **Даты доставки:** {dates_status}\n"
         "📍 **Самовывоз:** от любой суммы (адрес по связи с менеджером)\n\n"
         "Выберите действие:"
     )
     buttons = [
         [{"type": "callback", "text": "➕ Выложить новый товар в канал", "payload": "adm:new_prod"}],
+        [{"type": "callback", "text": "🛒 Брони в корзинах (расформировать)", "payload": "adm:active_carts"}],
         [{"type": "callback", "text": "📅 Открыть / изменить даты доставки", "payload": "adm:set_deliv_dates"}],
         [{"type": "callback", "text": "📦 Товары и остатки", "payload": "adm:list_prods"}],
         [{"type": "callback", "text": "📋 Заказы покупателей (и возврат в канал)", "payload": "adm:orders"}],
@@ -1127,6 +1203,78 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             await bot.send_message("\n".join(lines), user_id=user_id, buttons=btns)
             return
 
+        if payload == "adm:active_carts" and is_admin(user_id):
+            await bot.answer_callback(cb_id)
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.user_id, c.user_name, p.id, p.title, c.qty, p.price, c.created_at
+                FROM cart_items c
+                JOIN products p ON p.id = c.product_id
+                ORDER BY c.created_at DESC
+                """
+            )
+            c_rows = cur.fetchall()
+            conn.close()
+            if not c_rows:
+                await bot.send_message(
+                    f"🛒 **Активных броней в корзинах сейчас нет.**\n\n"
+                    f"ℹ️ Все новые брони хранятся в корзине покупателя **{CART_EXPIRE_DAYS} дней**, после чего корзина автоматически расформировывается, а товары возвращаются в канал «Цена ШОК».",
+                    user_id=user_id,
+                )
+                return
+
+            lines = [
+                f"🛒 **Активные брони в корзинах покупателей** (авто-расформирование через **{CART_EXPIRE_DAYS} дней**):\n"
+            ]
+            by_buyer: Dict[int, Dict[str, Any]] = {}
+            for buid, bname, pid, ptitle, cqty, pprice, cdate in c_rows:
+                binfo = by_buyer.setdefault(int(buid), {"name": bname or f"ID {buid}", "items": [], "total": 0})
+                date_short = (cdate or "")[:16]
+                binfo["items"].append(f"  • {ptitle} — {cqty} шт. × {pprice} руб. (от {date_short})")
+                binfo["total"] += cqty * pprice
+
+            btns = []
+            for buid, binfo in by_buyer.items():
+                lines.append(f"👤 **{binfo['name']}** — сумма **{binfo['total']} руб.**:")
+                lines.extend(binfo["items"])
+                btns.append(
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"❌ Расформировать корзину: {binfo['name'][:18]}",
+                            "payload": f"adm_drop_cart:{buid}",
+                        }
+                    ]
+                )
+            btns.append(
+                [
+                    {
+                        "type": "callback",
+                        "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
+                        "payload": "adm:clear_all_carts",
+                    }
+                ]
+            )
+            await bot.send_message("\n".join(lines), user_id=user_id, buttons=btns)
+            return
+
+        if payload.startswith("adm_drop_cart:") and is_admin(user_id):
+            buyer_id = int(payload.split(":", 1)[1])
+            restored = await clear_user_cart_with_return(bot, buyer_id)
+            if restored:
+                await bot.answer_callback(cb_id, "Корзина расформирована, товары возвращены в канал!")
+                await bot.send_message(
+                    f"✅ Корзина покупателя (ID `{buyer_id}`) принудительно расформирована.\n"
+                    f"Товары возвращены в канал «Цена ШОК»:\n• " + "\n• ".join(restored),
+                    user_id=user_id,
+                )
+            else:
+                await bot.answer_callback(cb_id, "Корзина уже пуста.")
+                await bot.send_message("ℹ️ Эта корзина уже пуста.", user_id=user_id)
+            return
+
         if payload == "adm:clear_all_carts" and is_admin(user_id):
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
@@ -1544,6 +1692,31 @@ async def publish_new_product_from_admin(
     await show_admin_menu(bot, admin_id)
 
 
+async def webhook_guard_loop(bot: MaxBotClient) -> None:
+    """Каждые 20 секунд проверяет и удаляет сторонние вебхуки (например botman.pro), чтобы они не перехватывали кнопки."""
+    while True:
+        try:
+            await asyncio.sleep(20)
+            await bot.clear_webhooks()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Ошибка в webhook_guard_loop: {e}")
+
+
+async def auto_expire_carts_loop(bot: MaxBotClient) -> None:
+    """Каждые 10 минут проверяет корзины старше 10 дней и автоматически расформировывает их с возвратом товара в канал."""
+    while True:
+        try:
+            await expire_old_carts(bot)
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Ошибка в auto_expire_carts_loop: {e}")
+            await asyncio.sleep(60)
+
+
 async def main() -> None:
     init_db()
     if not MAX_BOT_TOKEN:
@@ -1554,11 +1727,11 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v6: бесплатная доставка от 1500 руб + кнопки быстрой смены порога")
+    logger.info("Запущена версия v7: защита от перехвата вебхука + бронь 10 дней + принудительное расформирование корзин")
 
-    # Устанавливаем порог 1500 руб., возвращаем зависшие неоформленные корзины и обновляем активные посты
-    if get_setting("notified_v6_free_1500", "0") != "1":
-        set_setting("notified_v6_free_1500", "1")
+    # Устанавливаем порог 1500 руб. и отправляем обновлённую панель с кнопкой управления бронями
+    if get_setting("notified_v7_cart_expire_10d", "0") != "1":
+        set_setting("notified_v7_cart_expire_10d", "1")
         set_setting("free_delivery_min", "1500")
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -1577,13 +1750,12 @@ async def main() -> None:
             except Exception as e:
                 logger.warning(f"Не удалось обновить пост #{pid}: {e}")
         try:
-            await bot.send_message(
-                "✅ Порог бесплатной доставки обновлён: **от 1500 руб.**",
-                user_id=24725732,
-            )
             await show_admin_menu(bot, 24725732)
         except Exception:
             pass
+
+    guard_task = asyncio.create_task(webhook_guard_loop(bot))
+    expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
 
     marker: Optional[int] = None
     logger.info("Запущен Long Polling обновлений MAX API...")
@@ -1599,14 +1771,20 @@ async def main() -> None:
             if resp:
                 if "marker" in resp and resp["marker"] is not None:
                     marker = resp["marker"]
-                for upd in resp.get("updates", []):
+                updates_list = resp.get("updates", [])
+                if not updates_list:
+                    await bot.clear_webhooks()
+                for upd in updates_list:
                     try:
                         await process_update(bot, upd)
                     except Exception as e:
                         logger.exception(f"Ошибка обработки события: {e}")
             else:
+                await bot.clear_webhooks()
                 await asyncio.sleep(2)
     finally:
+        guard_task.cancel()
+        expire_task.cancel()
         await bot.close()
 
 
