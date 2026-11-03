@@ -2323,6 +2323,13 @@ async def main() -> None:
             except Exception as e:
                 logger.warning(f"Не удалось обновить пост #{pid}: {e}")
 
+    if get_setting("notified_v11_packed_issued", "0") != "1":
+        set_setting("notified_v11_packed_issued", "1")
+        try:
+            await show_admin_menu(bot, 24725732)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить обновлённое меню v11: {e}")
+
     guard_task = asyncio.create_task(webhook_guard_loop(bot))
     expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
 
