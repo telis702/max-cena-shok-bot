@@ -218,6 +218,10 @@ def format_buyer_mention(user_id: int, user_name: str, username: str = "") -> st
     return f"{mention} (нажмите на имя для открытия профиля, ID `{user_id}`)"
 
 
+def format_sku(product_id: int) -> str:
+    return f"АРТ-{1000 + int(product_id)}"
+
+
 # =====================================================================
 # КЛИЕНТ MAX BOT API (platform-api.max.ru)
 # =====================================================================
@@ -288,6 +292,7 @@ class MaxBotClient:
         chat_id: Optional[int] = None,
         buttons: Optional[List[List[Dict[str, Any]]]] = None,
         photo_payload: Optional[Dict[str, Any]] = None,
+        photo_payloads: Optional[List[Dict[str, Any]]] = None,
         text_format: str = "markdown",
     ) -> Optional[Dict[str, Any]]:
         params: Dict[str, Any] = {}
@@ -298,10 +303,19 @@ class MaxBotClient:
         else:
             return None
 
-        attachments: List[Dict[str, Any]] = []
+        all_photos: List[Dict[str, Any]] = []
         if photo_payload:
-            clean_photo = {"token": photo_payload["token"]} if "token" in photo_payload else photo_payload
-            attachments.append({"type": "image", "payload": clean_photo})
+            all_photos.append(photo_payload)
+        if photo_payloads:
+            for pp in photo_payloads:
+                if pp and pp not in all_photos:
+                    all_photos.append(pp)
+
+        attachments: List[Dict[str, Any]] = []
+        for pp in all_photos:
+            clean_photo = {"token": pp["token"]} if isinstance(pp, dict) and "token" in pp else pp
+            if clean_photo:
+                attachments.append({"type": "image", "payload": clean_photo})
         if buttons:
             attachments.append({"type": "inline_keyboard", "payload": {"buttons": buttons}})
 
@@ -310,7 +324,29 @@ class MaxBotClient:
             "format": text_format,
             "attachments": attachments,
         }
-        return await self.request("POST", "/messages", params=params, json_body=body)
+        res = await self.request("POST", "/messages", params=params, json_body=body)
+        if res is None and len(all_photos) > 1:
+            # Фолбек: если несколько фото в одном сообщении не прошли, отправляем дополнительные фото отдельно, а карточку с первым фото
+            for extra_pp in all_photos[:-1]:
+                clean_extra = {"token": extra_pp["token"]} if isinstance(extra_pp, dict) and "token" in extra_pp else extra_pp
+                await self.request(
+                    "POST",
+                    "/messages",
+                    params=params,
+                    json_body={"text": "", "attachments": [{"type": "image", "payload": clean_extra}]},
+                )
+            last_pp = all_photos[-1]
+            clean_last = {"token": last_pp["token"]} if isinstance(last_pp, dict) and "token" in last_pp else last_pp
+            fallback_att = [{"type": "image", "payload": clean_last}]
+            if buttons:
+                fallback_att.append({"type": "inline_keyboard", "payload": {"buttons": buttons}})
+            res = await self.request(
+                "POST",
+                "/messages",
+                params=params,
+                json_body={"text": text, "format": text_format, "attachments": fallback_att},
+            )
+        return res
 
     async def edit_message(
         self,
@@ -359,13 +395,15 @@ class MaxBotClient:
 # ФОРМИРОВАНИЕ ПОСТОВ В КАНАЛЕ И АВТОВОЗВРАТ ТОВАРОВ
 # =====================================================================
 def build_channel_post_text(product_id: int, title: str, price: int, available_qty: int) -> str:
+    sku = format_sku(product_id)
     qty_line = (
         f"📦 **В наличии:** {available_qty} шт."
         if available_qty > 1
         else "📦 **В наличии:** 1 шт. (последний экземпляр!)"
     )
     return (
-        f"🔥 **{title}**\n\n"
+        f"🔥 **{title}**\n"
+        f"🏷 **Артикул:** `{sku}`\n\n"
         f"💰 **Цена:** **{price} руб.**\n"
         f"{qty_line}\n\n"
         f"👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
@@ -449,7 +487,7 @@ def get_cart_summary(user_id: int) -> Dict[str, Any]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT c.id, c.product_id, c.qty, p.title, p.price
+        SELECT c.id, c.product_id, c.qty, p.title, p.price, p.photo_payload
         FROM cart_items c
         JOIN products p ON p.id = c.product_id
         WHERE c.user_id = ?
@@ -459,17 +497,25 @@ def get_cart_summary(user_id: int) -> Dict[str, Any]:
     )
     items = []
     total = 0
-    for cid, pid, qty, title, price in cur.fetchall():
+    for cid, pid, qty, title, price, photo_raw in cur.fetchall():
         subtotal = qty * price
         total += subtotal
+        photo_obj = None
+        if photo_raw:
+            try:
+                photo_obj = json.loads(photo_raw)
+            except Exception:
+                photo_obj = None
         items.append(
             {
                 "cart_id": cid,
                 "product_id": pid,
+                "sku": format_sku(pid),
                 "qty": qty,
                 "title": title,
                 "price": price,
                 "subtotal": subtotal,
+                "photo_payload": photo_obj,
             }
         )
     conn.close()
@@ -499,16 +545,20 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
 
     lines = ["🛍 **Ваша корзина:**\n"]
     buttons: List[List[Dict[str, Any]]] = []
+    cart_photos: List[Dict[str, Any]] = []
 
     for idx, it in enumerate(items, 1):
+        sku = it.get("sku") or format_sku(it["product_id"])
         lines.append(
-            f"{idx}. **{it['title']}** — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**"
+            f"{idx}. **{it['title']}** (`{sku}`) — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**"
         )
+        if it.get("photo_payload"):
+            cart_photos.append(it["photo_payload"])
         buttons.append(
             [
                 {
                     "type": "callback",
-                    "text": f"❌ Отменить: {it['title'][:22]} ({it['qty']} шт.)",
+                    "text": f"❌ Отменить: {it['title'][:20]} ({it['qty']} шт.)",
                     "payload": f"cart_del:{it['product_id']}",
                 }
             ]
@@ -548,6 +598,7 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
         text="\n".join(lines),
         user_id=user_id,
         buttons=buttons,
+        photo_payloads=cart_photos,
     )
 
 
@@ -589,15 +640,29 @@ async def reserve_product_for_user(
 
     await sync_channel_product_post(bot, product_id)
 
-    # Мгновенное уведомление администраторам о новой брони в корзину
+    # Мгновенное уведомление администраторам о новой брони + полный список корзины покупателя с фото и артикулами
     buyer_mention = format_buyer_mention(user_id, user_name)
+    sku = format_sku(product_id)
+    summary = get_cart_summary(user_id)
+    cart_lines = []
+    cart_photos: List[Dict[str, Any]] = []
+    for idx, it in enumerate(summary["items"], 1):
+        it_sku = it.get("sku") or format_sku(it["product_id"])
+        cart_lines.append(
+            f"{idx}. **{it['title']}** (`{it_sku}`) — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**"
+        )
+        if it.get("photo_payload"):
+            cart_photos.append(it["photo_payload"])
+
+    cart_block = "\n".join(cart_lines) if cart_lines else f"• **{title}** (`{sku}`) — {qty_to_add} шт."
     admin_book_text = (
         f"🛒 **НОВАЯ БРОНЬ В КАНАЛЕ «Цена ШОК»!**\n\n"
         f"👤 **Покупатель:** {buyer_mention}\n"
-        f"📦 **Товар:** **{title}** — {qty_to_add} шт. × {price} руб. = **{qty_to_add * price} руб.**\n"
+        f"📦 **Добавлено сейчас:** **{title}** (`{sku}`) — {qty_to_add} шт. × {price} руб. = **{qty_to_add * price} руб.**\n"
         f"📊 **Осталось в канале:** {new_avail} шт.\n\n"
-        "⏳ Товар добавлен в корзину покупателя (ожидает выбора других товаров и оформления доставки/самовывоза).\n"
-        "👇 Нажмите на синее имя покупателя выше, чтобы открыть его профиль, или напишите ему прямо через бота кнопкой ниже:"
+        f"🛍 **Вся корзина этого покупателя сейчас (итого {summary['total']} руб.):**\n"
+        f"{cart_block}\n\n"
+        "👇 Нажмите на синее имя покупателя выше для перехода в профиль, напишите ему через бота или снимите бронь:"
     )
     admin_book_btns = [
         [
@@ -610,13 +675,18 @@ async def reserve_product_for_user(
         [
             {
                 "type": "callback",
-                "text": f"🔄 Снять бронь и вернуть «{title[:18]}» в канал",
+                "text": f"🔄 Снять бронь «{title[:16]}» ({sku})",
                 "payload": f"adm_unbook:{user_id}:{product_id}",
             }
         ],
     ]
     for adm_id in get_all_admins():
-        await bot.send_message(text=admin_book_text, user_id=adm_id, buttons=admin_book_btns)
+        await bot.send_message(
+            text=admin_book_text,
+            user_id=adm_id,
+            buttons=admin_book_btns,
+            photo_payloads=cart_photos,
+        )
 
     return None
 
@@ -894,8 +964,12 @@ async def finish_checkout(
     conn.close()
 
     items_text = "\n".join(
-        [f"• **{it['title']}** — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**" for it in items]
+        [
+            f"• **{it['title']}** (`{it.get('sku') or format_sku(it['product_id'])}`) — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**"
+            for it in items
+        ]
     )
+    order_photos = [it["photo_payload"] for it in items if it.get("photo_payload")]
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
 
     if delivery_type == "delivery":
@@ -917,6 +991,7 @@ async def finish_checkout(
             [{"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url}],
             [{"type": "link", "text": "📢 Вернуться в канал «Цена ШОК»", "url": "https://max.ru/id631100036329_biz2"}],
         ],
+        photo_payloads=order_photos,
     )
 
     buyer_mention = format_buyer_mention(user_id, user_name, user_username)
@@ -925,7 +1000,7 @@ async def finish_checkout(
         f"👤 **Покупатель:** {buyer_mention}\n"
         f"📞 **Телефон / комментарий:** {phone_and_comment}\n"
         f"{delivery_info}\n\n"
-        f"📦 **Товары:**\n{items_text}\n\n"
+        f"📦 **Товары в корзине заказа:**\n{items_text}\n\n"
         f"💰 **Сумма заказа:** **{total} руб.**"
     )
     admin_buttons = [
@@ -946,7 +1021,12 @@ async def finish_checkout(
         ],
     ]
     for adm_id in get_all_admins():
-        await bot.send_message(text=admin_text, user_id=adm_id, buttons=admin_buttons)
+        await bot.send_message(
+            text=admin_text,
+            user_id=adm_id,
+            buttons=admin_buttons,
+            photo_payloads=order_photos,
+        )
 
 
 async def cancel_order_and_restore_to_channel(bot: MaxBotClient, order_id: int, admin_user_id: int) -> None:
@@ -1216,12 +1296,13 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             lines = ["📦 **Последние товары:**\n"]
             btns = []
             for pid, title, price, avail, tot in rows:
-                lines.append(f"• **#{pid} {title}** — {price} руб. (в наличии: **{avail}** из {tot} шт.)")
+                sku = format_sku(pid)
+                lines.append(f"• **`{sku}` {title}** — {price} руб. (в наличии: **{avail}** из {tot} шт.)")
                 btns.append(
                     [
                         {
                             "type": "callback",
-                            "text": f"🔄 Вернуть +1 шт. в канал (#{pid} {title[:18]})",
+                            "text": f"🔄 Вернуть +1 шт. в канал ({sku} {title[:14]})",
                             "payload": f"adm_ret1:{pid}",
                         }
                     ]
@@ -1248,7 +1329,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT c.user_id, c.user_name, p.id, p.title, c.qty, p.price, c.created_at
+                SELECT c.user_id, c.user_name, p.id, p.title, c.qty, p.price, c.created_at, p.photo_payload
                 FROM cart_items c
                 JOIN products p ON p.id = c.product_id
                 ORDER BY c.created_at DESC
@@ -1264,22 +1345,33 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
-            lines = [
-                f"🛒 **Активные брони в корзинах покупателей** (авто-расформирование через **{CART_EXPIRE_DAYS} дней**):\n"
-            ]
             by_buyer: Dict[int, Dict[str, Any]] = {}
-            for buid, bname, pid, ptitle, cqty, pprice, cdate in c_rows:
-                binfo = by_buyer.setdefault(int(buid), {"name": bname or f"ID {buid}", "items": [], "total": 0})
+            for buid, bname, pid, ptitle, cqty, pprice, cdate, photo_raw in c_rows:
+                binfo = by_buyer.setdefault(
+                    int(buid),
+                    {"name": bname or f"ID {buid}", "items": [], "total": 0, "photos": []},
+                )
                 date_short = (cdate or "")[:16]
-                binfo["items"].append(f"  • {ptitle} — {cqty} шт. × {pprice} руб. (от {date_short})")
+                sku = format_sku(pid)
+                binfo["items"].append(f"• **{ptitle}** (`{sku}`) — {cqty} шт. × {pprice} руб. (от {date_short})")
                 binfo["total"] += cqty * pprice
+                if photo_raw:
+                    try:
+                        p_obj = json.loads(photo_raw)
+                        if p_obj and p_obj not in binfo["photos"]:
+                            binfo["photos"].append(p_obj)
+                    except Exception:
+                        pass
 
-            btns = []
             for buid, binfo in by_buyer.items():
                 b_mention = format_buyer_mention(buid, binfo["name"])
-                lines.append(f"👤 {b_mention} — сумма **{binfo['total']} руб.**:")
-                lines.extend(binfo["items"])
-                btns.append(
+                card_text = (
+                    f"🛒 **Корзина покупателя** (авто-возврат через **{CART_EXPIRE_DAYS} дней**)\n\n"
+                    f"👤 **Покупатель:** {b_mention}\n"
+                    f"💰 **Сумма корзины:** **{binfo['total']} руб.**\n\n"
+                    f"📦 **Товары в корзине:**\n" + "\n".join(binfo["items"])
+                )
+                card_btns = [
                     [
                         {
                             "type": "callback",
@@ -1292,17 +1384,28 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                             "payload": f"adm_drop_cart:{buid}",
                         },
                     ]
-                )
-            btns.append(
-                [
-                    {
-                        "type": "callback",
-                        "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
-                        "payload": "adm:clear_all_carts",
-                    }
                 ]
-            )
-            await bot.send_message("\n".join(lines), user_id=user_id, buttons=btns)
+                await bot.send_message(
+                    text=card_text,
+                    user_id=user_id,
+                    buttons=card_btns,
+                    photo_payloads=binfo["photos"],
+                )
+
+            if len(by_buyer) > 1:
+                await bot.send_message(
+                    text="👇 Управление всеми активными корзинами:",
+                    user_id=user_id,
+                    buttons=[
+                        [
+                            {
+                                "type": "callback",
+                                "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
+                                "payload": "adm:clear_all_carts",
+                            }
+                        ]
+                    ],
+                )
             return
 
         if payload.startswith("adm_drop_cart:") and is_admin(user_id):
@@ -1370,18 +1473,32 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, user_id, user_name, user_username, phone, delivery_address, total_amount, status FROM orders ORDER BY id DESC LIMIT 10"
+                "SELECT id, user_id, user_name, user_username, phone, delivery_address, total_amount, items_json, status FROM orders ORDER BY id DESC LIMIT 10"
             )
             rows = cur.fetchall()
             conn.close()
             if not rows:
                 await bot.send_message("Заказов пока нет.", user_id=user_id)
                 return
-            for oid, buid, bname, buser, phone, addr, tot, st_val in rows:
+            for oid, buid, bname, buser, phone, addr, tot, items_raw, st_val in rows:
                 status_str = {"new": "🟢 Активен", "done": "✅ Выдан", "cancelled": "🔄 Отменён (возвращён в канал)"}.get(
                     st_val, st_val
                 )
                 b_mention = format_buyer_mention(buid, bname, buser or "")
+                ord_items_lines = []
+                ord_photos = []
+                try:
+                    parsed_items = json.loads(items_raw or "[]")
+                    for it in parsed_items:
+                        it_sku = it.get("sku") or format_sku(it.get("product_id", 0))
+                        ord_items_lines.append(
+                            f"• **{it.get('title', 'Товар')}** (`{it_sku}`) — {it.get('qty', 1)} шт. × {it.get('price', 0)} руб."
+                        )
+                        if it.get("photo_payload"):
+                            ord_photos.append(it["photo_payload"])
+                except Exception:
+                    pass
+                items_section = "\n📦 **Товары:**\n" + "\n".join(ord_items_lines) if ord_items_lines else ""
                 b_list = [
                     [
                         {
@@ -1409,11 +1526,13 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                         f"📋 **Заказ №{oid}** ({status_str})\n"
                         f"👤 Покупатель: {b_mention}\n"
                         f"📞 Телефон: {phone}\n"
-                        f"📍 Получение: {addr}\n"
+                        f"📍 Получение: {addr}"
+                        f"{items_section}\n"
                         f"💰 Сумма: **{tot} руб.**"
                     ),
                     user_id=user_id,
                     buttons=b_list,
+                    photo_payloads=ord_photos,
                 )
             return
 
@@ -1812,13 +1931,16 @@ async def publish_new_product_from_admin(
     conn.close()
 
     await sync_channel_product_post(bot, product_id)
+    sku = format_sku(product_id)
     await bot.send_message(
         text=(
-            f"✅ **Товар #{product_id} опубликован в канале «Цена ШОК»!**\n\n"
+            f"✅ **Товар опубликован в канале «Цена ШОК»!**\n\n"
             f"📦 **{title}**\n"
+            f"🏷 Артикул: **`{sku}`**\n"
             f"💰 Цена: **{price} руб.** | В наличии: **{qty} шт.**"
         ),
         user_id=admin_id,
+        photo_payload=photo_payload,
     )
     await show_admin_menu(bot, admin_id)
 
@@ -1858,20 +1980,14 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v9: кликабельный профиль покупателя + авто-бронь при закрытом диалоге")
+    logger.info("Запущена версия v10: авто-артикулы товаров (АРТ-1001) + фото товаров в корзине и бронях")
 
-    # Устанавливаем порог 1500 руб. и отправляем обновлённую панель с кнопкой управления бронями
-    if get_setting("notified_v7_cart_expire_10d", "0") != "1":
-        set_setting("notified_v7_cart_expire_10d", "1")
-        set_setting("free_delivery_min", "1500")
+    # Обновляем активные посты в канале с авто-артикулами АРТ-1001
+    if get_setting("notified_v10_sku_and_photos", "0") != "1":
+        set_setting("notified_v10_sku_and_photos", "1")
+        set_setting("free_delivery_min", get_setting("free_delivery_min", "1500"))
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT product_id, qty FROM cart_items")
-        stuck_carts = cur.fetchall()
-        cur.execute("DELETE FROM cart_items")
-        for pid, qty in stuck_carts:
-            cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
-        conn.commit()
         cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0")
         active_pids = [r[0] for r in cur.fetchall()]
         conn.close()
@@ -1880,10 +1996,6 @@ async def main() -> None:
                 await sync_channel_product_post(bot, pid)
             except Exception as e:
                 logger.warning(f"Не удалось обновить пост #{pid}: {e}")
-        try:
-            await show_admin_menu(bot, 24725732)
-        except Exception:
-            pass
 
     guard_task = asyncio.create_task(webhook_guard_loop(bot))
     expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
