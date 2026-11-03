@@ -64,7 +64,7 @@ DEFAULT_MANAGER_URL = os.getenv(
     "MANAGER_URL",
     "https://max.ru/u/f9LHodD0cOLwisaQT6OasJIhpM99nL8Pt9p-0FTvXvQrqhzv4wLKzzkPLzk",
 )
-SUPER_ADMIN_IDS = {24725732, 11879587}
+SUPER_ADMIN_IDS = {24725732}
 
 
 # =====================================================================
@@ -142,15 +142,12 @@ def init_db() -> None:
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("free_delivery_min", str(DEFAULT_FREE_DELIVERY)))
     cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("manager_url", DEFAULT_MANAGER_URL))
     cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("channel_chat_id", str(DEFAULT_CHANNEL_CHAT_ID)))
-    # Администраторы канала «Цена ШОК»: Елизавета (24725732) и владелец канала Елена (11879587)
+    # Администратор канала «Цена ШОК»: Елизавета (24725732)
     cur.execute(
         "INSERT OR IGNORE INTO admins (user_id, name, added_at) VALUES (?, ?, ?)",
         (24725732, "Елизавета", "2026-11-02 23:24:00"),
     )
-    cur.execute(
-        "INSERT OR IGNORE INTO admins (user_id, name, added_at) VALUES (?, ?, ?)",
-        (11879587, "Елена", "2026-11-02 23:24:00"),
-    )
+    cur.execute("DELETE FROM admins WHERE user_id = 11879587")
     conn.commit()
     conn.close()
 
@@ -837,17 +834,22 @@ async def handle_booking_trigger(
             user_id=user_id,
             buttons=rows,
         )
-        if callback_id:
-            if sent_prompt is None:
+        if sent_prompt is None:
+            # Покупатель ещё ни разу не запускал диалог с ботом (HTTP 404 Dialog not found) —
+            # сразу бронируем за ним 1 шт. и уведомляем администратора, а при входе в бот предложим выбрать доп. количество!
+            err = await reserve_product_for_user(bot, user_id, user_name, product_id, 1)
+            if not err and callback_id:
                 await bot.answer_callback(
                     callback_id,
-                    f"👉 Нажмите кнопку «🛍 Моя корзина» под этим постом и нажмите «Начать» в боте для выбора количества «{title}»!",
+                    f"✅ «{title}» (1 шт.) забронирован! Нажмите кнопку «🛍 Моя корзина» под постом, чтобы выбрать больше штук или оформить заказ.",
                 )
-            else:
-                await bot.answer_callback(
-                    callback_id,
-                    f"📩 Откройте чат с ботом (кнопка «Моя корзина»), чтобы выбрать количество товара «{title}»!",
-                )
+            elif callback_id:
+                await bot.answer_callback(callback_id, err or "Ошибка бронирования")
+        elif callback_id:
+            await bot.answer_callback(
+                callback_id,
+                f"📩 Откройте чат с ботом (кнопка «🛍 Моя корзина»), чтобы выбрать количество товара «{title}»!",
+            )
 
 
 async def finish_checkout(
@@ -1856,7 +1858,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v8: прямая ссылка на профиль покупателя (max://user/ID) + связь с покупателем через бота")
+    logger.info("Запущена версия v9: кликабельный профиль покупателя + авто-бронь при закрытом диалоге")
 
     # Устанавливаем порог 1500 руб. и отправляем обновлённую панель с кнопкой управления бронями
     if get_setting("notified_v7_cart_expire_10d", "0") != "1":
