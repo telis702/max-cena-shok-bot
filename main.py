@@ -666,20 +666,38 @@ async def reserve_product_for_user(
     )
     admin_book_btns = [
         [
+            {"type": "callback", "text": "📦 Корзина собрана", "payload": f"adm_cart_packed:{user_id}"},
+            {"type": "callback", "text": "✅ Товар выдан (закрыть)", "payload": f"adm_cart_issued:{user_id}"},
+        ],
+        [
             {
                 "type": "callback",
                 "text": f"✉️ Написать покупателю ({user_name[:16]})",
                 "payload": f"adm_msg_user:{user_id}",
             }
         ],
-        [
-            {
-                "type": "callback",
-                "text": f"🔄 Снять бронь «{title[:16]}» ({sku})",
-                "payload": f"adm_unbook:{user_id}:{product_id}",
-            }
-        ],
     ]
+    for it in summary["items"]:
+        it_sku = it.get("sku") or format_sku(it["product_id"])
+        admin_book_btns.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"➖ Убрать 1 шт.: {it['title'][:15]} ({it_sku})",
+                    "payload": f"adm_unbook:{user_id}:{it['product_id']}",
+                }
+            ]
+        )
+    if len(summary["items"]) > 1:
+        admin_book_btns.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"❌ Расформировать всю корзину ({user_name[:14]})",
+                    "payload": f"adm_drop_cart:{user_id}",
+                }
+            ]
+        )
     for adm_id in get_all_admins():
         await bot.send_message(
             text=admin_book_text,
@@ -691,7 +709,12 @@ async def reserve_product_for_user(
     return None
 
 
-async def return_product_from_cart(bot: MaxBotClient, user_id: int, product_id: int) -> Optional[str]:
+async def return_product_from_cart(
+    bot: MaxBotClient,
+    user_id: int,
+    product_id: int,
+    only_one_unit: bool = False,
+) -> Optional[str]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -703,13 +726,22 @@ async def return_product_from_cart(bot: MaxBotClient, user_id: int, product_id: 
         conn.close()
         return None
     qty, title = row
-    cur.execute("DELETE FROM cart_items WHERE user_id = ? AND product_id = ?", (user_id, product_id))
-    cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, product_id))
+    sku = format_sku(product_id)
+    if only_one_unit and qty > 1:
+        remove_qty = 1
+        cur.execute(
+            "UPDATE cart_items SET qty = qty - 1 WHERE user_id = ? AND product_id = ?",
+            (user_id, product_id),
+        )
+    else:
+        remove_qty = qty
+        cur.execute("DELETE FROM cart_items WHERE user_id = ? AND product_id = ?", (user_id, product_id))
+    cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (remove_qty, product_id))
     conn.commit()
     conn.close()
 
     await sync_channel_product_post(bot, product_id)
-    return f"Бронь на «{title}» ({qty} шт.) отменена, товар возвращён в канал."
+    return f"Товар «{title}» ({sku}, {remove_qty} шт.) убран из корзины и возвращён в канал."
 
 
 async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> List[str]:
@@ -822,7 +854,7 @@ async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
     )
     buttons = [
         [{"type": "callback", "text": "➕ Выложить новый товар в канал", "payload": "adm:new_prod"}],
-        [{"type": "callback", "text": "🛒 Брони в корзинах (расформировать)", "payload": "adm:active_carts"}],
+        [{"type": "callback", "text": "🛒 Корзины покупателей (сборка / выдача / бронь)", "payload": "adm:active_carts"}],
         [{"type": "callback", "text": "📅 Открыть / изменить даты доставки", "payload": "adm:set_deliv_dates"}],
         [{"type": "callback", "text": "📦 Товары и остатки", "payload": "adm:list_prods"}],
         [{"type": "callback", "text": "📋 Заказы покупателей (и возврат в канал)", "payload": "adm:orders"}],
@@ -1005,21 +1037,37 @@ async def finish_checkout(
     )
     admin_buttons = [
         [
+            {"type": "callback", "text": f"📦 Корзина собрана (#{order_id})", "payload": f"ord_packed:{order_id}"},
+            {"type": "callback", "text": f"✅ Товар выдан (#{order_id})", "payload": f"ord_done:{order_id}"},
+        ],
+        [
             {
                 "type": "callback",
                 "text": f"✉️ Написать покупателю ({user_name[:16]})",
                 "payload": f"adm_msg_user:{user_id}",
             }
         ],
-        [{"type": "callback", "text": f"✅ Заказ №{order_id} выдан / выполнен", "payload": f"ord_done:{order_id}"}],
+    ]
+    for it in items:
+        it_sku = it.get("sku") or format_sku(it["product_id"])
+        admin_buttons.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"➖ Убрать 1 шт.: {it['title'][:15]} ({it_sku})",
+                    "payload": f"ord_del_item:{order_id}:{it['product_id']}",
+                }
+            ]
+        )
+    admin_buttons.append(
         [
             {
                 "type": "callback",
-                "text": f"🔄 Отказ — вернуть товары заказа №{order_id} в канал",
+                "text": f"🔄 Полный отказ — вернуть весь заказ №{order_id} в канал",
                 "payload": f"ord_cancel:{order_id}",
             }
-        ],
-    ]
+        ]
+    )
     for adm_id in get_all_admins():
         await bot.send_message(
             text=admin_text,
@@ -1349,11 +1397,12 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             for buid, bname, pid, ptitle, cqty, pprice, cdate, photo_raw in c_rows:
                 binfo = by_buyer.setdefault(
                     int(buid),
-                    {"name": bname or f"ID {buid}", "items": [], "total": 0, "photos": []},
+                    {"name": bname or f"ID {buid}", "items": [], "raw_items": [], "total": 0, "photos": []},
                 )
                 date_short = (cdate or "")[:16]
                 sku = format_sku(pid)
                 binfo["items"].append(f"• **{ptitle}** (`{sku}`) — {cqty} шт. × {pprice} руб. (от {date_short})")
+                binfo["raw_items"].append({"product_id": pid, "title": ptitle, "sku": sku, "qty": cqty})
                 binfo["total"] += cqty * pprice
                 if photo_raw:
                     try:
@@ -1365,26 +1414,47 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
 
             for buid, binfo in by_buyer.items():
                 b_mention = format_buyer_mention(buid, binfo["name"])
+                packed_flag = get_setting(f"cart_packed_{buid}", "0") == "1"
+                status_badge = "📦 **Статус: Корзина собрана (ожидает выдачи)**" if packed_flag else "🟡 **Статус: Собирается / В брони**"
                 card_text = (
-                    f"🛒 **Корзина покупателя** (авто-возврат через **{CART_EXPIRE_DAYS} дней**)\n\n"
+                    f"🛒 **Корзина покупателя** (авто-возврат через **{CART_EXPIRE_DAYS} дней**)\n"
+                    f"{status_badge}\n\n"
                     f"👤 **Покупатель:** {b_mention}\n"
                     f"💰 **Сумма корзины:** **{binfo['total']} руб.**\n\n"
                     f"📦 **Товары в корзине:**\n" + "\n".join(binfo["items"])
                 )
                 card_btns = [
                     [
+                        {"type": "callback", "text": "📦 Корзина собрана", "payload": f"adm_cart_packed:{buid}"},
+                        {"type": "callback", "text": "✅ Товар выдан (закрыть)", "payload": f"adm_cart_issued:{buid}"},
+                    ],
+                    [
                         {
                             "type": "callback",
-                            "text": f"✉️ Написать: {binfo['name'][:16]}",
+                            "text": f"✉️ Написать покупателю ({binfo['name'][:16]})",
                             "payload": f"adm_msg_user:{buid}",
-                        },
+                        }
+                    ],
+                ]
+                for rit in binfo["raw_items"]:
+                    card_btns.append(
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"➖ Убрать 1 шт.: {rit['title'][:15]} ({rit['sku']})",
+                                "payload": f"adm_unbook:{buid}:{rit['product_id']}",
+                            }
+                        ]
+                    )
+                card_btns.append(
+                    [
                         {
                             "type": "callback",
-                            "text": f"❌ Расформировать: {binfo['name'][:14]}",
+                            "text": f"❌ Расформировать всю корзину: {binfo['name'][:14]}",
                             "payload": f"adm_drop_cart:{buid}",
-                        },
+                        }
                     ]
-                ]
+                )
                 await bot.send_message(
                     text=card_text,
                     user_id=user_id,
@@ -1408,9 +1478,130 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
             return
 
+        if payload.startswith("adm_cart_packed:") and is_admin(user_id):
+            buyer_id = int(payload.split(":", 1)[1])
+            summary = get_cart_summary(buyer_id)
+            if not summary["items"]:
+                await bot.answer_callback(cb_id, "Корзина покупателя уже пуста.")
+                await bot.send_message("ℹ️ Корзина этого покупателя уже пуста или закрыта.", user_id=user_id)
+                return
+            set_setting(f"cart_packed_{buyer_id}", "1")
+            items_lines = "\n".join(
+                [f"• **{it['title']}** (`{it['sku']}`) — {it['qty']} шт. × {it['price']} руб." for it in summary["items"]]
+            )
+            manager_url = get_setting("manager_contact", "https://max.ru/id631100036329_biz2")
+            await bot.send_message(
+                text=(
+                    f"📦 **Ваша корзина в магазине «Цена ШОК» собрана и готова к выдаче / доставке!**\n\n"
+                    f"{items_lines}\n\n"
+                    f"💰 **Итого:** **{summary['total']} руб.**"
+                ),
+                user_id=buyer_id,
+                buttons=[[{"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url}]],
+                photo_payloads=summary.get("photos", []),
+            )
+            await bot.answer_callback(cb_id, "Отмечено: Корзина собрана! Покупателю отправлено уведомление.")
+            await bot.send_message(
+                f"📦 Статус корзины покупателя (ID `{buyer_id}`) изменён на **«Корзина собрана»**. Покупателю отправлено уведомление в бот!",
+                user_id=user_id,
+            )
+            return
+
+        if payload.startswith("adm_cart_issued:") and is_admin(user_id):
+            buyer_id = int(payload.split(":", 1)[1])
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.user_name, p.id, p.title, p.price, c.qty, p.photo_payload
+                FROM cart_items c
+                JOIN products p ON p.id = c.product_id
+                WHERE c.user_id = ?
+                """,
+                (buyer_id,),
+            )
+            c_rows = cur.fetchall()
+            if not c_rows:
+                conn.close()
+                await bot.answer_callback(cb_id, "Корзина уже пуста или выдана.")
+                await bot.send_message("ℹ️ Эта корзина уже пуста или была выдана ранее.", user_id=user_id)
+                return
+
+            bname = c_rows[0][0] or f"ID {buyer_id}"
+            items_list = []
+            total_sum = 0
+            for _, pid, ptitle, pprice, cqty, photo_raw in c_rows:
+                p_obj = None
+                if photo_raw:
+                    try:
+                        p_obj = json.loads(photo_raw)
+                    except Exception:
+                        p_obj = None
+                sub = pprice * cqty
+                total_sum += sub
+                items_list.append(
+                    {
+                        "product_id": pid,
+                        "sku": format_sku(pid),
+                        "title": ptitle,
+                        "price": pprice,
+                        "qty": cqty,
+                        "subtotal": sub,
+                        "photo_payload": p_obj,
+                    }
+                )
+
+            cur.execute(
+                """
+                INSERT INTO orders (user_id, user_name, user_username, phone, delivery_address, total_amount, items_json, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'done', ?)
+                """,
+                (
+                    buyer_id,
+                    bname,
+                    "",
+                    "Выдан из корзины",
+                    "Самовывоз / Выдан администратором",
+                    total_sum,
+                    json.dumps(items_list, ensure_ascii=False),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            order_id = cur.lastrowid
+            cur.execute("DELETE FROM cart_items WHERE user_id = ?", (buyer_id,))
+            conn.commit()
+            conn.close()
+            set_setting(f"cart_packed_{buyer_id}", "0")
+
+            items_lines = "\n".join(
+                [f"• **{it['title']}** (`{it['sku']}`) — {it['qty']} шт. × {it['price']} руб." for it in items_list]
+            )
+            await bot.send_message(
+                text=(
+                    f"✅ **Товар выдан! Ваш заказ №{order_id} закрыт.**\n\n"
+                    f"📦 **Выданные товары:**\n{items_lines}\n\n"
+                    f"💰 **Итого:** **{total_sum} руб.**\n"
+                    f"Спасибо за покупку в канале «Цена ШОК»! Будем рады видеть вас снова!"
+                ),
+                user_id=buyer_id,
+                buttons=[
+                    [{"type": "link", "text": "📢 Вернуться в канал «Цена ШОК»", "url": "https://max.ru/id631100036329_biz2"}]
+                ],
+            )
+            await bot.answer_callback(cb_id, f"Товар выдан! Заказ №{order_id} закрыт.")
+            await bot.send_message(
+                f"✅ **Товар выдан, заказ №{order_id} закрыт!**\n"
+                f"👤 Покупатель: {format_buyer_mention(buyer_id, bname)}\n"
+                f"💰 Сумма: **{total_sum} руб.**\n"
+                f"Корзина покупателя очищена (проданные товары списаны и в канал не возвращаются).",
+                user_id=user_id,
+            )
+            return
+
         if payload.startswith("adm_drop_cart:") and is_admin(user_id):
             buyer_id = int(payload.split(":", 1)[1])
             restored = await clear_user_cart_with_return(bot, buyer_id)
+            set_setting(f"cart_packed_{buyer_id}", "0")
             if restored:
                 await bot.answer_callback(cb_id, "Корзина расформирована, товары возвращены в канал!")
                 await bot.send_message(
@@ -1447,13 +1638,16 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if payload.startswith("adm_unbook:") and is_admin(user_id):
             _, buyer_s, pid_s = payload.split(":")
             buyer_id, pid = int(buyer_s), int(pid_s)
-            msg = await return_product_from_cart(bot, buyer_id, pid)
+            msg = await return_product_from_cart(bot, buyer_id, pid, only_one_unit=True)
             if msg:
-                await bot.answer_callback(cb_id, "Бронь снята, товар возвращён в канал!")
-                await bot.send_message(f"✅ {msg}", user_id=user_id)
+                await bot.answer_callback(cb_id, "1 шт. убрана из корзины и возвращена в канал!")
+                await bot.send_message(
+                    f"✅ **Частичное удаление из корзины:**\n{msg}\nОстальные товары в корзине покупателя сохранены.",
+                    user_id=user_id,
+                )
             else:
-                await bot.answer_callback(cb_id, "Эта бронь уже была снята или оформлена в заказ.")
-                await bot.send_message("ℹ️ Эта бронь уже была снята или переведена в оформленные заказы.", user_id=user_id)
+                await bot.answer_callback(cb_id, "Этот товар уже был убран из корзины или выдан.")
+                await bot.send_message("ℹ️ Этот товар уже был убран из корзины или заказ уже закрыт.", user_id=user_id)
             return
 
         if payload.startswith("adm_ret1:") and is_admin(user_id):
@@ -1481,12 +1675,16 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await bot.send_message("Заказов пока нет.", user_id=user_id)
                 return
             for oid, buid, bname, buser, phone, addr, tot, items_raw, st_val in rows:
-                status_str = {"new": "🟢 Активен", "done": "✅ Выдан", "cancelled": "🔄 Отменён (возвращён в канал)"}.get(
-                    st_val, st_val
-                )
+                status_str = {
+                    "new": "🟢 Активен (собирается)",
+                    "packed": "📦 Корзина собрана (ожидает выдачи)",
+                    "done": "✅ Товар выдан (заказ закрыт)",
+                    "cancelled": "🔄 Отменён (возвращён в канал)",
+                }.get(st_val, st_val)
                 b_mention = format_buyer_mention(buid, bname, buser or "")
                 ord_items_lines = []
                 ord_photos = []
+                parsed_items = []
                 try:
                     parsed_items = json.loads(items_raw or "[]")
                     for it in parsed_items:
@@ -1494,7 +1692,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                         ord_items_lines.append(
                             f"• **{it.get('title', 'Товар')}** (`{it_sku}`) — {it.get('qty', 1)} шт. × {it.get('price', 0)} руб."
                         )
-                        if it.get("photo_payload"):
+                        if it.get("photo_payload") and it["photo_payload"] not in ord_photos:
                             ord_photos.append(it["photo_payload"])
                 except Exception:
                     pass
@@ -1508,17 +1706,34 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                         }
                     ]
                 ]
-                if st_val == "new":
-                    b_list.extend(
+                if st_val in ("new", "packed"):
+                    b_list.insert(
+                        0,
                         [
-                            [{"type": "callback", "text": f"✅ Выдан (#{oid})", "payload": f"ord_done:{oid}"}],
-                            [
-                                {
-                                    "type": "callback",
-                                    "text": f"🔄 Отказ — вернуть товары #{oid} в канал",
-                                    "payload": f"ord_cancel:{oid}",
-                                }
-                            ],
+                            {"type": "callback", "text": f"📦 Корзина собрана (#{oid})", "payload": f"ord_packed:{oid}"},
+                            {"type": "callback", "text": f"✅ Товар выдан (#{oid})", "payload": f"ord_done:{oid}"},
+                        ],
+                    )
+                    for it in parsed_items:
+                        it_pid = it.get("product_id", 0)
+                        it_sku = it.get("sku") or format_sku(it_pid)
+                        if it_pid:
+                            b_list.append(
+                                [
+                                    {
+                                        "type": "callback",
+                                        "text": f"➖ Убрать 1 шт.: {it.get('title', 'Товар')[:15]} ({it_sku})",
+                                        "payload": f"ord_del_item:{oid}:{it_pid}",
+                                    }
+                                ]
+                            )
+                    b_list.append(
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"🔄 Полный отказ — вернуть товары #{oid} в канал",
+                                "payload": f"ord_cancel:{oid}",
+                            }
                         ]
                     )
                 await bot.send_message(
@@ -1549,15 +1764,126 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             )
             return
 
+        if payload.startswith("ord_packed:") and is_admin(user_id):
+            oid = int(payload.split(":", 1)[1])
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, total_amount, items_json, status FROM orders WHERE id = ?", (oid,))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                await bot.answer_callback(cb_id, "Заказ не найден.")
+                return
+            buid, tot, items_raw, st_val = row
+            if st_val in ("done", "cancelled"):
+                conn.close()
+                await bot.answer_callback(cb_id, "Этот заказ уже закрыт или отменён.")
+                return
+            cur.execute("UPDATE orders SET status = 'packed' WHERE id = ?", (oid,))
+            conn.commit()
+            conn.close()
+            manager_url = get_setting("manager_contact", "https://max.ru/id631100036329_biz2")
+            await bot.send_message(
+                text=(
+                    f"📦 **Ваш заказ №{oid} в магазине «Цена ШОК» собран и готов к выдаче / доставке!**\n"
+                    f"💰 Сумма заказа: **{tot} руб.**"
+                ),
+                user_id=buid,
+                buttons=[[{"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url}]],
+            )
+            await bot.answer_callback(cb_id, f"Заказ №{oid}: Корзина собрана! Покупатель уведомлён.")
+            await bot.send_message(
+                f"📦 Заказ **№{oid}** отмечен как **«Корзина собрана»**. Покупателю отправлено уведомление!",
+                user_id=user_id,
+            )
+            return
+
+        if payload.startswith("ord_del_item:") and is_admin(user_id):
+            _, oid_s, pid_s = payload.split(":")
+            oid, pid = int(oid_s), int(pid_s)
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, total_amount, items_json, status FROM orders WHERE id = ?", (oid,))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                await bot.answer_callback(cb_id, "Заказ не найден.")
+                return
+            buid, tot, items_raw, st_val = row
+            if st_val in ("done", "cancelled"):
+                conn.close()
+                await bot.answer_callback(cb_id, "Заказ уже закрыт или отменён.")
+                return
+            parsed_items = json.loads(items_raw or "[]")
+            target_idx = None
+            for idx, it in enumerate(parsed_items):
+                if int(it.get("product_id", 0)) == pid:
+                    target_idx = idx
+                    break
+            if target_idx is None:
+                conn.close()
+                await bot.answer_callback(cb_id, "Этот товар уже убран из заказа.")
+                return
+            target_item = parsed_items[target_idx]
+            title = target_item.get("title", f"Товар #{pid}")
+            price = int(target_item.get("price", 0))
+            sku = target_item.get("sku") or format_sku(pid)
+            cur_qty = int(target_item.get("qty", 1))
+            if cur_qty > 1:
+                target_item["qty"] = cur_qty - 1
+                target_item["subtotal"] = target_item["qty"] * price
+            else:
+                parsed_items.pop(target_idx)
+            new_tot = sum(int(x.get("price", 0)) * int(x.get("qty", 1)) for x in parsed_items)
+            cur.execute("UPDATE products SET available_qty = available_qty + 1 WHERE id = ?", (pid,))
+            if parsed_items:
+                cur.execute(
+                    "UPDATE orders SET items_json = ?, total_amount = ? WHERE id = ?",
+                    (json.dumps(parsed_items, ensure_ascii=False), new_tot, oid),
+                )
+            else:
+                cur.execute(
+                    "UPDATE orders SET items_json = '[]', total_amount = 0, status = 'cancelled' WHERE id = ?",
+                    (oid,),
+                )
+            conn.commit()
+            conn.close()
+            await sync_channel_product_post(bot, pid)
+            await bot.answer_callback(cb_id, f"Убрана 1 шт. «{title}» и возвращена в канал!")
+            await bot.send_message(
+                f"✅ Из заказа **№{oid}** убрана 1 шт. товара **«{title}»** (`{sku}`) и возвращена в канал «Цена ШОК».\n"
+                f"Новая сумма заказа: **{new_tot} руб.**",
+                user_id=user_id,
+            )
+            return
+
         if payload.startswith("ord_done:") and is_admin(user_id):
             oid = int(payload.split(":", 1)[1])
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
+            cur.execute("SELECT user_id, total_amount FROM orders WHERE id = ?", (oid,))
+            row = cur.fetchone()
             cur.execute("UPDATE orders SET status = 'done' WHERE id = ?", (oid,))
             conn.commit()
             conn.close()
-            await bot.answer_callback(cb_id, f"Заказ №{oid} отмечен как выданный!")
-            await bot.send_message(f"✅ Заказ №{oid} успешно закрыт (выдан клиенту).", user_id=user_id)
+            if row:
+                buid, tot = row
+                await bot.send_message(
+                    text=(
+                        f"✅ **Товар выдан! Ваш заказ №{oid} закрыт.**\n"
+                        f"💰 Сумма: **{tot} руб.**\n"
+                        f"Спасибо за покупку в канале «Цена ШОК»! Будем рады видеть вас снова!"
+                    ),
+                    user_id=buid,
+                    buttons=[
+                        [{"type": "link", "text": "📢 Вернуться в канал «Цена ШОК»", "url": "https://max.ru/id631100036329_biz2"}]
+                    ],
+                )
+            await bot.answer_callback(cb_id, f"Заказ №{oid} отмечен как выданный и закрыт!")
+            await bot.send_message(
+                f"✅ **Товар выдан!** Заказ №{oid} успешно закрыт (проданные товары списаны и в канал не возвращаются).",
+                user_id=user_id,
+            )
             return
 
         if payload.startswith("ord_cancel:") and is_admin(user_id):
@@ -1980,7 +2306,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v10: авто-артикулы товаров (АРТ-1001) + фото товаров в корзине и бронях")
+    logger.info("Запущена версия v11: статусы Корзина собрана / Товар выдан + частичное удаление 1 товара из корзины")
 
     # Обновляем активные посты в канале с авто-артикулами АРТ-1001
     if get_setting("notified_v10_sku_and_photos", "0") != "1":
