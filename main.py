@@ -203,6 +203,24 @@ def get_all_admins() -> List[int]:
     return list(rows)
 
 
+def extract_user_display_name(user_obj: Dict[str, Any]) -> str:
+    full = (user_obj.get("name") or "").strip()
+    fn = (user_obj.get("first_name") or "").strip()
+    ln = (user_obj.get("last_name") or "").strip()
+    combined = f"{fn} {ln}".strip()
+    if combined and len(combined) > len(full):
+        return combined
+    return full or combined or "Покупатель"
+
+
+def format_buyer_mention(user_id: int, user_name: str, username: str = "") -> str:
+    clean_name = (user_name or "Покупатель").replace("[", "(").replace("]", ")")
+    mention = f"[{clean_name}](max://user/{user_id})"
+    if username:
+        return f"{mention} (@{username}, ID `{user_id}`)"
+    return f"{mention} (нажмите на имя для открытия профиля, ID `{user_id}`)"
+
+
 # =====================================================================
 # КЛИЕНТ MAX BOT API (platform-api.max.ru)
 # =====================================================================
@@ -258,6 +276,10 @@ class MaxBotClient:
                     logger.warning(f"MAX API {method} {path} HTTP {resp.status}: {text}")
                     return None
                 return json.loads(text) if text else {}
+        except asyncio.TimeoutError:
+            if path != "/updates":
+                logger.warning(f"Таймаут запроса MAX API {method} {path}")
+            return None
         except Exception as e:
             logger.error(f"Ошибка запроса MAX API {method} {path}: {e}")
             return None
@@ -571,22 +593,30 @@ async def reserve_product_for_user(
     await sync_channel_product_post(bot, product_id)
 
     # Мгновенное уведомление администраторам о новой брони в корзину
+    buyer_mention = format_buyer_mention(user_id, user_name)
     admin_book_text = (
         f"🛒 **НОВАЯ БРОНЬ В КАНАЛЕ «Цена ШОК»!**\n\n"
-        f"👤 **Покупатель:** {user_name} (ID `{user_id}`)\n"
+        f"👤 **Покупатель:** {buyer_mention}\n"
         f"📦 **Товар:** **{title}** — {qty_to_add} шт. × {price} руб. = **{qty_to_add * price} руб.**\n"
         f"📊 **Осталось в канале:** {new_avail} шт.\n\n"
         "⏳ Товар добавлен в корзину покупателя (ожидает выбора других товаров и оформления доставки/самовывоза).\n"
-        "Если покупатель передумал, вы можете сразу вернуть товар в канал кнопкой ниже:"
+        "👇 Нажмите на синее имя покупателя выше, чтобы открыть его профиль, или напишите ему прямо через бота кнопкой ниже:"
     )
     admin_book_btns = [
+        [
+            {
+                "type": "callback",
+                "text": f"✉️ Написать покупателю ({user_name[:16]})",
+                "payload": f"adm_msg_user:{user_id}",
+            }
+        ],
         [
             {
                 "type": "callback",
                 "text": f"🔄 Снять бронь и вернуть «{title[:18]}» в канал",
                 "payload": f"adm_unbook:{user_id}:{product_id}",
             }
-        ]
+        ],
     ]
     for adm_id in get_all_admins():
         await bot.send_message(text=admin_book_text, user_id=adm_id, buttons=admin_book_btns)
@@ -887,16 +917,23 @@ async def finish_checkout(
         ],
     )
 
-    user_link = f"https://max.ru/{user_username}" if user_username else f"ID {user_id}"
+    buyer_mention = format_buyer_mention(user_id, user_name, user_username)
     admin_text = (
         f"🔔 **НОВЫЙ ЗАКАЗ №{order_id} («Цена ШОК»)**\n\n"
-        f"👤 **Покупатель:** {user_name} ({user_link})\n"
+        f"👤 **Покупатель:** {buyer_mention}\n"
         f"📞 **Телефон / комментарий:** {phone_and_comment}\n"
         f"{delivery_info}\n\n"
         f"📦 **Товары:**\n{items_text}\n\n"
         f"💰 **Сумма заказа:** **{total} руб.**"
     )
     admin_buttons = [
+        [
+            {
+                "type": "callback",
+                "text": f"✉️ Написать покупателю ({user_name[:16]})",
+                "payload": f"adm_msg_user:{user_id}",
+            }
+        ],
         [{"type": "callback", "text": f"✅ Заказ №{order_id} выдан / выполнен", "payload": f"ord_done:{order_id}"}],
         [
             {
@@ -976,7 +1013,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
     if utype == "bot_started":
         user = upd.get("user", {})
         user_id = user.get("user_id")
-        user_name = user.get("name", "Покупатель")
+        user_name = extract_user_display_name(user)
         payload = (upd.get("payload") or "").strip()
         if not user_id:
             return
@@ -1008,7 +1045,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         payload = cb.get("payload", "")
         user = cb.get("user", {})
         user_id = user.get("user_id")
-        user_name = user.get("name", "Покупатель")
+        user_name = extract_user_display_name(user)
         user_username = user.get("username", "")
         if not user_id:
             return
@@ -1237,15 +1274,21 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
 
             btns = []
             for buid, binfo in by_buyer.items():
-                lines.append(f"👤 **{binfo['name']}** — сумма **{binfo['total']} руб.**:")
+                b_mention = format_buyer_mention(buid, binfo["name"])
+                lines.append(f"👤 {b_mention} — сумма **{binfo['total']} руб.**:")
                 lines.extend(binfo["items"])
                 btns.append(
                     [
                         {
                             "type": "callback",
-                            "text": f"❌ Расформировать корзину: {binfo['name'][:18]}",
+                            "text": f"✉️ Написать: {binfo['name'][:16]}",
+                            "payload": f"adm_msg_user:{buid}",
+                        },
+                        {
+                            "type": "callback",
+                            "text": f"❌ Расформировать: {binfo['name'][:14]}",
                             "payload": f"adm_drop_cart:{buid}",
-                        }
+                        },
                     ]
                 )
             btns.append(
@@ -1325,39 +1368,64 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, user_name, phone, delivery_address, total_amount, status FROM orders ORDER BY id DESC LIMIT 10"
+                "SELECT id, user_id, user_name, user_username, phone, delivery_address, total_amount, status FROM orders ORDER BY id DESC LIMIT 10"
             )
             rows = cur.fetchall()
             conn.close()
             if not rows:
                 await bot.send_message("Заказов пока нет.", user_id=user_id)
                 return
-            for oid, bname, phone, addr, tot, st_val in rows:
+            for oid, buid, bname, buser, phone, addr, tot, st_val in rows:
                 status_str = {"new": "🟢 Активен", "done": "✅ Выдан", "cancelled": "🔄 Отменён (возвращён в канал)"}.get(
                     st_val, st_val
                 )
-                b_list = []
-                if st_val == "new":
-                    b_list = [
-                        [{"type": "callback", "text": f"✅ Выдан (#{oid})", "payload": f"ord_done:{oid}"}],
-                        [
-                            {
-                                "type": "callback",
-                                "text": f"🔄 Отказ — вернуть товары #{oid} в канал",
-                                "payload": f"ord_cancel:{oid}",
-                            }
-                        ],
+                b_mention = format_buyer_mention(buid, bname, buser or "")
+                b_list = [
+                    [
+                        {
+                            "type": "callback",
+                            "text": f"✉️ Написать покупателю ({(bname or 'Клиент')[:16]})",
+                            "payload": f"adm_msg_user:{buid}",
+                        }
                     ]
+                ]
+                if st_val == "new":
+                    b_list.extend(
+                        [
+                            [{"type": "callback", "text": f"✅ Выдан (#{oid})", "payload": f"ord_done:{oid}"}],
+                            [
+                                {
+                                    "type": "callback",
+                                    "text": f"🔄 Отказ — вернуть товары #{oid} в канал",
+                                    "payload": f"ord_cancel:{oid}",
+                                }
+                            ],
+                        ]
+                    )
                 await bot.send_message(
                     text=(
                         f"📋 **Заказ №{oid}** ({status_str})\n"
-                        f"👤 Покупатель: {bname} | 📞 {phone}\n"
+                        f"👤 Покупатель: {b_mention}\n"
+                        f"📞 Телефон: {phone}\n"
                         f"📍 Получение: {addr}\n"
                         f"💰 Сумма: **{tot} руб.**"
                     ),
                     user_id=user_id,
                     buttons=b_list,
                 )
+            return
+
+        if payload.startswith("adm_msg_user:") and is_admin(user_id):
+            buyer_id = int(payload.split(":", 1)[1])
+            await bot.answer_callback(cb_id)
+            USER_STATES[user_id] = {"state": "adm_await_msg_to_user", "target_user_id": buyer_id}
+            await bot.send_message(
+                text=(
+                    f"✉️ **Сообщение покупателю** ([Открыть профиль в MAX](max://user/{buyer_id}), ID `{buyer_id}`)\n\n"
+                    "Напишите в ответном сообщении текст, который нужно отправить этому покупателю от имени магазина (он получит его прямо в этот бот вместе с кнопкой связи с вами):"
+                ),
+                user_id=user_id,
+            )
             return
 
         if payload.startswith("ord_done:") and is_admin(user_id):
@@ -1455,7 +1523,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
 
         sender = msg.get("sender", {})
         user_id = sender.get("user_id")
-        user_name = sender.get("name", "Покупатель")
+        user_name = extract_user_display_name(sender)
         user_username = sender.get("username", "")
         body = msg.get("body", {})
         text = (body.get("text") or "").strip()
@@ -1631,6 +1699,35 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_admin_menu(bot, user_id)
                 return
 
+            if state_name == "adm_await_msg_to_user":
+                target_uid = int(st.get("target_user_id", 0))
+                USER_STATES.pop(user_id, None)
+                if not text:
+                    await bot.send_message("Отправка отменена (пустое сообщение).", user_id=user_id)
+                    return
+                manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
+                sent_ok = await bot.send_message(
+                    text=(
+                        f"👩‍💼 **Сообщение от менеджера канала «Цена ШОК»:**\n\n"
+                        f"{text}\n\n"
+                        "👇 Вы можете ответить прямо здесь в чате бота или написать менеджеру в личные сообщения по кнопке ниже:"
+                    ),
+                    user_id=target_uid,
+                    buttons=[[{"type": "link", "text": "👩‍💼 Написать менеджеру в ЛС", "url": manager_url}]],
+                )
+                if sent_ok is not None:
+                    await bot.send_message(
+                        f"✅ Ваше сообщение доставлено покупателю ([Открыть профиль](max://user/{target_uid}), ID `{target_uid}`).",
+                        user_id=user_id,
+                    )
+                else:
+                    await bot.send_message(
+                        f"⚠️ Покупатель ([Открыть профиль](max://user/{target_uid})) ещё не запускал диалог с ботом. Нажмите на синюю ссылку «Открыть профиль», чтобы написать ему напрямую.",
+                        user_id=user_id,
+                    )
+                await show_admin_menu(bot, user_id)
+                return
+
         if is_admin(user_id):
             only_digits = "".join(ch for ch in text if ch.isdigit())
             if only_digits and (text.strip().isdigit() or "достав" in text.lower()) and int(only_digits) >= 100:
@@ -1641,6 +1738,38 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 await show_admin_menu(bot, user_id)
                 return
+        elif text:
+            # Если покупатель написал сообщение в бот — пересылаем администратору с кликабельной ссылкой на профиль и содержимым корзины
+            b_mention = format_buyer_mention(user_id, user_name, user_username)
+            summary = get_cart_summary(user_id)
+            cart_info = (
+                ", ".join([f"{it['title']} ({it['qty']} шт.)" for it in summary["items"]])
+                if summary["items"]
+                else "корзина пуста"
+            )
+            for adm_id in get_all_admins():
+                await bot.send_message(
+                    text=(
+                        f"💬 **Сообщение от покупателя в боте:**\n"
+                        f"👤 Покупатель: {b_mention}\n"
+                        f"🛍 В корзине: {cart_info}\n\n"
+                        f"📝 **Текст:** {text}"
+                    ),
+                    user_id=adm_id,
+                    buttons=[
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"✉️ Ответить ({user_name[:16]})",
+                                "payload": f"adm_msg_user:{user_id}",
+                            }
+                        ]
+                    ],
+                )
+            await bot.send_message(
+                "✅ Ваше сообщение передано менеджеру! Ниже ваша текущая корзина:",
+                user_id=user_id,
+            )
 
         await show_user_cart(bot, user_id)
         if is_admin(user_id):
@@ -1727,7 +1856,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v7: защита от перехвата вебхука + бронь 10 дней + принудительное расформирование корзин")
+    logger.info("Запущена версия v8: прямая ссылка на профиль покупателя (max://user/ID) + связь с покупателем через бота")
 
     # Устанавливаем порог 1500 руб. и отправляем обновлённую панель с кнопкой управления бронями
     if get_setting("notified_v7_cart_expire_10d", "0") != "1":
