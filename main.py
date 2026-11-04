@@ -854,13 +854,159 @@ async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
     )
     buttons = [
         [{"type": "callback", "text": "➕ Выложить новый товар в канал", "payload": "adm:new_prod"}],
-        [{"type": "callback", "text": "🛒 Корзины покупателей (сборка / выдача / бронь)", "payload": "adm:active_carts"}],
+        [{"type": "callback", "text": "🛒 Корзины покупателей (выбрать человека)", "payload": "adm:active_carts"}],
+        [{"type": "callback", "text": "🔍 Найти корзину по имени или ID", "payload": "adm:search_cart"}],
         [{"type": "callback", "text": "📅 Открыть / изменить даты доставки", "payload": "adm:set_deliv_dates"}],
         [{"type": "callback", "text": "📦 Товары и остатки", "payload": "adm:list_prods"}],
         [{"type": "callback", "text": "📋 Заказы покупателей (и возврат в канал)", "payload": "adm:orders"}],
         [{"type": "callback", "text": "🚚 Изменить порог бесплатной доставки", "payload": "adm:set_free_min"}],
     ]
     await bot.send_message(text=text, user_id=user_id, buttons=buttons)
+
+
+async def send_single_buyer_cart_to_admin(bot: MaxBotClient, admin_user_id: int, buyer_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.user_id, c.user_name, p.id, p.title, c.qty, p.price, c.created_at, p.photo_payload
+        FROM cart_items c
+        JOIN products p ON p.id = c.product_id
+        WHERE c.user_id = ?
+        ORDER BY c.created_at DESC
+        """,
+        (buyer_id,),
+    )
+    c_rows = cur.fetchall()
+    conn.close()
+    if not c_rows:
+        return False
+
+    bname = c_rows[0][1] or f"ID {buyer_id}"
+    items_lines = []
+    raw_items = []
+    total_sum = 0
+    photos = []
+    for _, _, pid, ptitle, cqty, pprice, cdate, photo_raw in c_rows:
+        date_short = (cdate or "")[:16]
+        sku = format_sku(pid)
+        items_lines.append(f"• **{ptitle}** (`{sku}`) — {cqty} шт. × {pprice} руб. (от {date_short})")
+        raw_items.append({"product_id": pid, "title": ptitle, "sku": sku, "qty": cqty})
+        total_sum += cqty * pprice
+        if photo_raw:
+            try:
+                p_obj = json.loads(photo_raw)
+                if p_obj and p_obj not in photos:
+                    photos.append(p_obj)
+            except Exception:
+                pass
+
+    b_mention = format_buyer_mention(buyer_id, bname)
+    packed_flag = get_setting(f"cart_packed_{buyer_id}", "0") == "1"
+    status_badge = (
+        "📦 **Статус: Корзина собрана (ожидает выдачи)**"
+        if packed_flag
+        else "🟡 **Статус: Собирается / В брони**"
+    )
+    card_text = (
+        f"🛒 **Корзина покупателя** (авто-возврат через **{CART_EXPIRE_DAYS} дней**)\n"
+        f"{status_badge}\n\n"
+        f"👤 **Покупатель:** {b_mention}\n"
+        f"💰 **Сумма корзины:** **{total_sum} руб.**\n\n"
+        f"📦 **Товары в корзине:**\n" + "\n".join(items_lines)
+    )
+    card_btns = [
+        [
+            {"type": "callback", "text": "📦 Корзина собрана", "payload": f"adm_cart_packed:{buyer_id}"},
+            {"type": "callback", "text": "✅ Товар выдан (закрыть)", "payload": f"adm_cart_issued:{buyer_id}"},
+        ],
+        [
+            {
+                "type": "callback",
+                "text": f"✉️ Написать покупателю ({bname[:16]})",
+                "payload": f"adm_msg_user:{buyer_id}",
+            }
+        ],
+    ]
+    for rit in raw_items:
+        card_btns.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"➖ Убрать 1 шт.: {rit['title'][:15]} ({rit['sku']})",
+                    "payload": f"adm_unbook:{buyer_id}:{rit['product_id']}",
+                }
+            ]
+        )
+    card_btns.append(
+        [
+            {
+                "type": "callback",
+                "text": f"❌ Расформировать всю корзину: {bname[:14]}",
+                "payload": f"adm_drop_cart:{buyer_id}",
+            }
+        ]
+    )
+    await bot.send_message(
+        text=card_text,
+        user_id=admin_user_id,
+        buttons=card_btns,
+        photo_payloads=photos,
+    )
+    return True
+
+
+async def search_and_send_buyer_carts(bot: MaxBotClient, admin_user_id: int, query_text: str) -> None:
+    q = query_text.strip().lower()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.user_id, c.user_name, SUM(c.qty), SUM(c.qty * p.price)
+        FROM cart_items c
+        JOIN products p ON p.id = c.product_id
+        GROUP BY c.user_id
+        ORDER BY MAX(c.created_at) DESC
+        """
+    )
+    buyer_rows = cur.fetchall()
+    conn.close()
+
+    if not buyer_rows:
+        await bot.send_message("🛒 Сейчас нет ни одной активной корзины.", user_id=admin_user_id)
+        return
+
+    matched_ids = []
+    for buid, bname, _, _ in buyer_rows:
+        name_low = (bname or "").lower()
+        if q in name_low or q in str(buid):
+            matched_ids.append(int(buid))
+
+    if matched_ids:
+        for buid in matched_ids:
+            await send_single_buyer_cart_to_admin(bot, admin_user_id, buid)
+        return
+
+    btns = []
+    for buid, bname, total_qty, total_sum in buyer_rows[:15]:
+        disp_name = (bname or f"ID {buid}")[:18]
+        btns.append(
+            [
+                {
+                    "type": "callback",
+                    "text": f"🛒 {disp_name} — {total_qty} шт. ({total_sum} руб.)",
+                    "payload": f"adm_view_cart:{buid}",
+                }
+            ]
+        )
+    await bot.send_message(
+        text=(
+            f"🔍 По запросу **«{query_text.strip()}»** активная корзина не найдена.\n\n"
+            "Ниже список покупателей, у которых сейчас есть товары в корзине — нажмите на нужного человека:"
+        ),
+        user_id=admin_user_id,
+        buttons=btns,
+    )
 
 
 # =====================================================================
@@ -1210,12 +1356,82 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             await bot.answer_callback(cb_id, msg or "Удалено из корзины")
             if msg:
                 await bot.send_message(f"🔄 {msg}", user_id=user_id)
+                buyer_mention = format_buyer_mention(user_id, user_name, user_username)
+                rem_summary = get_cart_summary(user_id)
+                if rem_summary["items"]:
+                    rem_lines = "\n".join(
+                        [
+                            f"• **{it['title']}** (`{it['sku']}`) — {it['qty']} шт. × {it['price']} руб."
+                            for it in rem_summary["items"]
+                        ]
+                    )
+                    rem_block = f"🛍 **Осталось в корзине покупателя ({rem_summary['total']} руб.):**\n{rem_lines}"
+                    adm_btns = [
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"🛒 Открыть корзину ({user_name[:14]})",
+                                "payload": f"adm_view_cart:{user_id}",
+                            }
+                        ],
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"✉️ Написать покупателю ({user_name[:14]})",
+                                "payload": f"adm_msg_user:{user_id}",
+                            }
+                        ],
+                    ]
+                else:
+                    set_setting(f"cart_packed_{user_id}", "0")
+                    rem_block = "🛍 **Корзина покупателя теперь полностью пуста.**"
+                    adm_btns = [
+                        [
+                            {
+                                "type": "callback",
+                                "text": f"✉️ Написать покупателю ({user_name[:14]})",
+                                "payload": f"adm_msg_user:{user_id}",
+                            }
+                        ]
+                    ]
+                for adm_id in get_all_admins():
+                    await bot.send_message(
+                        text=(
+                            f"⚠️ **ОТМЕНА БРОНИ ПОКУПАТЕЛЕМ!**\n\n"
+                            f"👤 **Покупатель:** {buyer_mention}\n"
+                            f"🔄 **Возвращено в канал:** {msg}\n\n"
+                            f"{rem_block}"
+                        ),
+                        user_id=adm_id,
+                        buttons=adm_btns,
+                    )
             await show_user_cart(bot, user_id)
             return
 
         if payload == "cart_clear":
-            await clear_user_cart_with_return(bot, user_id)
+            restored = await clear_user_cart_with_return(bot, user_id)
+            set_setting(f"cart_packed_{user_id}", "0")
             await bot.answer_callback(cb_id, "Корзина очищена, товары возвращены в канал")
+            if restored:
+                buyer_mention = format_buyer_mention(user_id, user_name, user_username)
+                for adm_id in get_all_admins():
+                    await bot.send_message(
+                        text=(
+                            f"⚠️ **ПОКУПАТЕЛЬ ПОЛНОСТЬЮ ОТМЕНИЛ БРОНЬ (ОЧИСТИЛ КОРЗИНУ)!**\n\n"
+                            f"👤 **Покупатель:** {buyer_mention}\n"
+                            f"🔄 **Товары возвращены в канал «Цена ШОК»:**\n• " + "\n• ".join(restored)
+                        ),
+                        user_id=adm_id,
+                        buttons=[
+                            [
+                                {
+                                    "type": "callback",
+                                    "text": f"✉️ Написать покупателю ({user_name[:14]})",
+                                    "payload": f"adm_msg_user:{user_id}",
+                                }
+                            ]
+                        ],
+                    )
             await show_user_cart(bot, user_id)
             return
 
@@ -1371,21 +1587,22 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             await bot.send_message("\n".join(lines), user_id=user_id, buttons=btns)
             return
 
-        if payload == "adm:active_carts" and is_admin(user_id):
+        if payload in ("adm:active_carts", "adm:active_carts_all") and is_admin(user_id):
             await bot.answer_callback(cb_id)
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT c.user_id, c.user_name, p.id, p.title, c.qty, p.price, c.created_at, p.photo_payload
+                SELECT c.user_id, c.user_name, SUM(c.qty), SUM(c.qty * p.price)
                 FROM cart_items c
                 JOIN products p ON p.id = c.product_id
-                ORDER BY c.created_at DESC
+                GROUP BY c.user_id
+                ORDER BY MAX(c.created_at) DESC
                 """
             )
-            c_rows = cur.fetchall()
+            buyer_rows = cur.fetchall()
             conn.close()
-            if not c_rows:
+            if not buyer_rows:
                 await bot.send_message(
                     f"🛒 **Активных броней в корзинах сейчас нет.**\n\n"
                     f"ℹ️ Все новые брони хранятся в корзине покупателя **{CART_EXPIRE_DAYS} дней**, после чего корзина автоматически расформировывается, а товары возвращаются в канал «Цена ШОК».",
@@ -1393,89 +1610,84 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
-            by_buyer: Dict[int, Dict[str, Any]] = {}
-            for buid, bname, pid, ptitle, cqty, pprice, cdate, photo_raw in c_rows:
-                binfo = by_buyer.setdefault(
-                    int(buid),
-                    {"name": bname or f"ID {buid}", "items": [], "raw_items": [], "total": 0, "photos": []},
-                )
-                date_short = (cdate or "")[:16]
-                sku = format_sku(pid)
-                binfo["items"].append(f"• **{ptitle}** (`{sku}`) — {cqty} шт. × {pprice} руб. (от {date_short})")
-                binfo["raw_items"].append({"product_id": pid, "title": ptitle, "sku": sku, "qty": cqty})
-                binfo["total"] += cqty * pprice
-                if photo_raw:
-                    try:
-                        p_obj = json.loads(photo_raw)
-                        if p_obj and p_obj not in binfo["photos"]:
-                            binfo["photos"].append(p_obj)
-                    except Exception:
-                        pass
-
-            for buid, binfo in by_buyer.items():
-                b_mention = format_buyer_mention(buid, binfo["name"])
-                packed_flag = get_setting(f"cart_packed_{buid}", "0") == "1"
-                status_badge = "📦 **Статус: Корзина собрана (ожидает выдачи)**" if packed_flag else "🟡 **Статус: Собирается / В брони**"
-                card_text = (
-                    f"🛒 **Корзина покупателя** (авто-возврат через **{CART_EXPIRE_DAYS} дней**)\n"
-                    f"{status_badge}\n\n"
-                    f"👤 **Покупатель:** {b_mention}\n"
-                    f"💰 **Сумма корзины:** **{binfo['total']} руб.**\n\n"
-                    f"📦 **Товары в корзине:**\n" + "\n".join(binfo["items"])
-                )
-                card_btns = [
-                    [
-                        {"type": "callback", "text": "📦 Корзина собрана", "payload": f"adm_cart_packed:{buid}"},
-                        {"type": "callback", "text": "✅ Товар выдан (закрыть)", "payload": f"adm_cart_issued:{buid}"},
-                    ],
-                    [
-                        {
-                            "type": "callback",
-                            "text": f"✉️ Написать покупателю ({binfo['name'][:16]})",
-                            "payload": f"adm_msg_user:{buid}",
-                        }
-                    ],
-                ]
-                for rit in binfo["raw_items"]:
-                    card_btns.append(
-                        [
-                            {
-                                "type": "callback",
-                                "text": f"➖ Убрать 1 шт.: {rit['title'][:15]} ({rit['sku']})",
-                                "payload": f"adm_unbook:{buid}:{rit['product_id']}",
-                            }
-                        ]
+            if len(buyer_rows) == 1 or payload == "adm:active_carts_all":
+                for buid, _, _, _ in buyer_rows:
+                    await send_single_buyer_cart_to_admin(bot, user_id, int(buid))
+                if len(buyer_rows) > 1:
+                    await bot.send_message(
+                        text="👇 Управление всеми активными корзинами:",
+                        user_id=user_id,
+                        buttons=[
+                            [
+                                {
+                                    "type": "callback",
+                                    "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
+                                    "payload": "adm:clear_all_carts",
+                                }
+                            ]
+                        ],
                     )
-                card_btns.append(
+                return
+
+            # Если корзин несколько — показываем удобный выбор конкретного покупателя без вываливания всех чужих броней разом
+            selector_btns = []
+            for buid, bname, total_qty, total_sum in buyer_rows[:25]:
+                disp_name = (bname or f"ID {buid}")[:18]
+                packed_mark = "📦 " if get_setting(f"cart_packed_{buid}", "0") == "1" else "🛒 "
+                selector_btns.append(
                     [
                         {
                             "type": "callback",
-                            "text": f"❌ Расформировать всю корзину: {binfo['name'][:14]}",
-                            "payload": f"adm_drop_cart:{buid}",
+                            "text": f"{packed_mark}{disp_name} — {total_qty} шт. ({total_sum} руб.)",
+                            "payload": f"adm_view_cart:{buid}",
                         }
                     ]
                 )
-                await bot.send_message(
-                    text=card_text,
-                    user_id=user_id,
-                    buttons=card_btns,
-                    photo_payloads=binfo["photos"],
-                )
+            selector_btns.append(
+                [{"type": "callback", "text": "🔍 Найти корзину по имени / ID", "payload": "adm:search_cart"}]
+            )
+            selector_btns.append(
+                [{"type": "callback", "text": "📋 Показать все корзины подряд", "payload": "adm:active_carts_all"}]
+            )
+            selector_btns.append(
+                [
+                    {
+                        "type": "callback",
+                        "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
+                        "payload": "adm:clear_all_carts",
+                    }
+                ]
+            )
+            await bot.send_message(
+                text=(
+                    f"🛒 **Активные корзины покупателей ({len(buyer_rows)} чел.)**\n\n"
+                    "👇 Нажмите на нужного покупателя в списке ниже, чтобы открыть **только его корзину** (без списка всех остальных людей), "
+                    "или просто **напишите имя / ID покупателя** прямо в чат:"
+                ),
+                user_id=user_id,
+                buttons=selector_btns,
+            )
+            return
 
-            if len(by_buyer) > 1:
-                await bot.send_message(
-                    text="👇 Управление всеми активными корзинами:",
-                    user_id=user_id,
-                    buttons=[
-                        [
-                            {
-                                "type": "callback",
-                                "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
-                                "payload": "adm:clear_all_carts",
-                            }
-                        ]
-                    ],
-                )
+        if payload.startswith("adm_view_cart:") and is_admin(user_id):
+            buyer_id = int(payload.split(":", 1)[1])
+            await bot.answer_callback(cb_id)
+            found = await send_single_buyer_cart_to_admin(bot, user_id, buyer_id)
+            if not found:
+                await bot.send_message("ℹ️ Корзина этого покупателя сейчас пуста или уже выдана.", user_id=user_id)
+            return
+
+        if payload == "adm:search_cart" and is_admin(user_id):
+            await bot.answer_callback(cb_id)
+            USER_STATES[user_id] = {"state": "adm_await_cart_search"}
+            await bot.send_message(
+                text=(
+                    "🔍 **Поиск корзины покупателя**\n\n"
+                    "Напишите в ответном сообщении **имя покупателя** (или часть имени, например `Кристина`) либо его **ID** — "
+                    "и бот покажет корзину только этого человека:"
+                ),
+                user_id=user_id,
+            )
             return
 
         if payload.startswith("adm_cart_packed:") and is_admin(user_id):
@@ -2175,15 +2387,26 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 await show_admin_menu(bot, user_id)
                 return
 
+            if state_name == "adm_await_cart_search":
+                USER_STATES.pop(user_id, None)
+                if not text:
+                    await show_admin_menu(bot, user_id)
+                    return
+                await search_and_send_buyer_carts(bot, user_id, text)
+                return
+
         if is_admin(user_id):
             only_digits = "".join(ch for ch in text if ch.isdigit())
-            if only_digits and (text.strip().isdigit() or "достав" in text.lower()) and int(only_digits) >= 100:
+            if only_digits and (text.strip().isdigit() or "достав" in text.lower()) and 100 <= int(only_digits) <= 50000:
                 set_setting("free_delivery_min", only_digits)
                 await bot.send_message(
                     f"✅ Порог бесплатной доставки обновлён: **от {only_digits} руб.**",
                     user_id=user_id,
                 )
                 await show_admin_menu(bot, user_id)
+                return
+            if text and not text.startswith("/"):
+                await search_and_send_buyer_carts(bot, user_id, text)
                 return
         elif text:
             # Если покупатель написал сообщение в бот — пересылаем администратору с кликабельной ссылкой на профиль и содержимым корзины
@@ -2306,7 +2529,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v11: статусы Корзина собрана / Товар выдан + частичное удаление 1 товара из корзины")
+    logger.info("Запущена версия v12: уведомления об отмене брони покупателем + персональный выбор и поиск корзины отдельного человека")
 
     # Обновляем активные посты в канале с авто-артикулами АРТ-1001
     if get_setting("notified_v10_sku_and_photos", "0") != "1":
@@ -2323,12 +2546,12 @@ async def main() -> None:
             except Exception as e:
                 logger.warning(f"Не удалось обновить пост #{pid}: {e}")
 
-    if get_setting("notified_v11_packed_issued", "0") != "1":
-        set_setting("notified_v11_packed_issued", "1")
+    if get_setting("notified_v12_cancel_and_search", "0") != "1":
+        set_setting("notified_v12_cancel_and_search", "1")
         try:
             await show_admin_menu(bot, 24725732)
         except Exception as e:
-            logger.warning(f"Не удалось отправить обновлённое меню v11: {e}")
+            logger.warning(f"Не удалось отправить обновлённое меню v12: {e}")
 
     guard_task = asyncio.create_task(webhook_guard_loop(bot))
     expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
