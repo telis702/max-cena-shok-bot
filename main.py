@@ -25,6 +25,8 @@ import base64
 import json
 import logging
 import os
+import re
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,7 +57,20 @@ MAX_BOT_TOKEN = (
     or os.getenv("MAX_TOKEN")
     or base64.b64decode(_DEFAULT_B64).decode("utf-8")
 ).strip()
-DB_PATH = BASE_DIR / "shop_data.db"
+def _resolve_persistent_db_path() -> Path:
+    local_db = BASE_DIR / "shop_data.db"
+    try:
+        persist_dir = Path.home() / ".max_cena_shok_data"
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        persist_db = persist_dir / "shop_data.db"
+        if local_db.exists() and (not persist_db.exists() or local_db.stat().st_size > persist_db.stat().st_size):
+            shutil.copy2(local_db, persist_db)
+        return persist_db
+    except Exception:
+        return local_db
+
+
+DB_PATH = _resolve_persistent_db_path()
 
 DEFAULT_CHANNEL_CHAT_ID = -79384826402979
 DEFAULT_FREE_DELIVERY = int(os.getenv("FREE_DELIVERY_THRESHOLD", "1500"))
@@ -1074,6 +1089,233 @@ async def search_and_send_buyer_carts(bot: MaxBotClient, admin_user_id: int, que
     )
 
 
+def parse_channel_post_data(msg_obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not msg_obj or not isinstance(msg_obj, dict):
+        return None
+    body = msg_obj.get("body") or {}
+    mid = body.get("mid")
+    text = (body.get("text") or "").strip()
+    if not mid or not text.startswith("🔥"):
+        return None
+
+    lines = text.splitlines()
+    title_lines = []
+    price = 0
+    avail_qty = 1
+    unit = "шт."
+    sku_num = 0
+
+    for line in lines:
+        s = line.strip().replace("**", "").replace("`", "")
+        if s.startswith("🏷") and "АРТ-" in s:
+            m_sku = re.search(r"АРТ-(\d+)", s)
+            if m_sku:
+                sku_num = int(m_sku.group(1)) - 1000
+        elif s.startswith("💰") and "Цена:" in s:
+            m_pr = re.search(r"Цена:\s*(\d+)", s)
+            if m_pr:
+                price = int(m_pr.group(1))
+        elif s.startswith("📦") and "В наличии:" in s:
+            m_q = re.search(r"В наличии:\s*(\d+)\s*(уп\.|шт\.)", s)
+            if m_q:
+                avail_qty = int(m_q.group(1))
+                unit = m_q.group(2)
+        elif s.startswith("👇"):
+            break
+        else:
+            if not price and not sku_num:
+                clean_t = line.strip()
+                if clean_t.startswith("🔥"):
+                    clean_t = clean_t[1:].strip()
+                if clean_t.startswith("**") and clean_t.endswith("**"):
+                    clean_t = clean_t[2:-2].strip()
+                if clean_t:
+                    title_lines.append(clean_t)
+
+    title = "\n".join(title_lines).strip()
+    if not title or price <= 0:
+        return None
+
+    attachments = body.get("attachments") or []
+    photos = []
+    btn_pid = None
+    has_book_btn = False
+    for att in attachments:
+        if att.get("type") == "image" and att.get("payload"):
+            p = att["payload"]
+            if "token" in p:
+                photos.append({"token": p["token"]})
+        elif att.get("type") == "inline_keyboard":
+            for row in att.get("payload", {}).get("buttons", []):
+                for b in row:
+                    pl = b.get("payload", "")
+                    if pl.startswith("book:") or pl.startswith("book_qty:"):
+                        has_book_btn = True
+                        try:
+                            btn_pid = int(pl.split(":")[1])
+                        except Exception:
+                            pass
+
+    return {
+        "mid": mid,
+        "title": title,
+        "price": price,
+        "avail_qty": avail_qty,
+        "unit": unit,
+        "sku_num": sku_num,
+        "btn_pid": btn_pid,
+        "has_book_btn": has_book_btn,
+        "photos": photos,
+    }
+
+
+async def resolve_product_from_callback(
+    bot: MaxBotClient,
+    pid: int,
+    cb_message: Optional[Dict[str, Any]],
+) -> int:
+    parsed = parse_channel_post_data(cb_message)
+    if not parsed:
+        return pid
+
+    mid = parsed["mid"]
+    post_title = parsed["title"]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 1. Ищем товар по точному channel_message_id (mid поста в канале)
+    cur.execute("SELECT id, title, available_qty FROM products WHERE channel_message_id = ?", (mid,))
+    row_by_mid = cur.fetchone()
+    if row_by_mid:
+        db_id, db_title, db_avail = row_by_mid
+        if db_avail <= 0 and parsed["has_book_btn"] and parsed["avail_qty"] > 0:
+            cur.execute("SELECT SUM(qty) FROM cart_items WHERE product_id = ?", (db_id,))
+            in_carts = cur.fetchone()[0] or 0
+            if in_carts == 0:
+                cur.execute("UPDATE products SET available_qty = ? WHERE id = ?", (parsed["avail_qty"], db_id))
+                conn.commit()
+        conn.close()
+        return int(db_id)
+
+    # 2. Проверяем товар по pid из кнопки: совпадает ли название с постом в канале?
+    cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE id = ?", (pid,))
+    row_by_id = cur.fetchone()
+    if row_by_id:
+        db_id, db_title, db_avail, db_mid = row_by_id
+        if (db_title or "").strip().lower() == post_title.strip().lower():
+            cur.execute(
+                "UPDATE products SET channel_message_id = ?, available_qty = CASE WHEN available_qty <= 0 THEN ? ELSE available_qty END WHERE id = ?",
+                (mid, parsed["avail_qty"], db_id),
+            )
+            conn.commit()
+            conn.close()
+            return int(db_id)
+
+    # 3. Если pid в БД занят другим товаром (например «Ботинки р.36» вместо «Джемпер мужской р.М») или не существует —
+    # автоматически регистрируем настоящий товар прямо из поста канала!
+    cur.execute(
+        """
+        INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """,
+        (
+            post_title,
+            parsed["price"],
+            parsed["avail_qty"],
+            parsed["avail_qty"],
+            json.dumps(parsed["photos"], ensure_ascii=False) if parsed["photos"] else None,
+            DEFAULT_CHANNEL_CHAT_ID,
+            mid,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    new_pid = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    set_setting(f"prod_unit_{new_pid}", parsed["unit"])
+    logger.info(f"Авто-восстановлен товар из поста канала: #{new_pid} «{post_title}» (mid={mid})")
+    return new_pid
+
+
+async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None:
+    try:
+        resp = await bot.request("GET", "/messages", params={"chat_id": ch_id, "count": 100})
+        if not resp or "messages" not in resp:
+            return
+        msgs = resp.get("messages") or []
+        max_seen_id = 60
+        parsed_posts = []
+        for m in msgs:
+            p = parse_channel_post_data(m)
+            if p:
+                if p["sku_num"] > max_seen_id:
+                    max_seen_id = p["sku_num"]
+                if p["btn_pid"] and p["btn_pid"] > max_seen_id:
+                    max_seen_id = p["btn_pid"]
+                if p["has_book_btn"]:
+                    parsed_posts.append(p)
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(id) FROM products")
+        cur_max = cur.fetchone()[0] or 0
+        target_seq = max(max_seen_id, cur_max, 60)
+        cur.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
+        cur.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (target_seq,))
+        conn.commit()
+
+        pids_to_update_in_channel = []
+        for p in reversed(parsed_posts):
+            mid = p["mid"]
+            cur.execute("SELECT id, title FROM products WHERE channel_message_id = ?", (mid,))
+            by_mid = cur.fetchone()
+            if by_mid:
+                continue
+
+            btn_pid = p["btn_pid"]
+            if btn_pid:
+                cur.execute("SELECT id, title, channel_message_id FROM products WHERE id = ?", (btn_pid,))
+                by_id = cur.fetchone()
+                if by_id and (by_id[1] or "").strip().lower() == p["title"].strip().lower():
+                    cur.execute(
+                        "UPDATE products SET channel_message_id = ?, available_qty = CASE WHEN available_qty <= 0 THEN ? ELSE available_qty END WHERE id = ?",
+                        (mid, p["avail_qty"], btn_pid),
+                    )
+                    conn.commit()
+                    continue
+
+            cur.execute(
+                """
+                INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    p["title"],
+                    p["price"],
+                    p["avail_qty"],
+                    p["avail_qty"],
+                    json.dumps(p["photos"], ensure_ascii=False) if p["photos"] else None,
+                    ch_id,
+                    mid,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            new_id = int(cur.lastrowid)
+            conn.commit()
+            set_setting(f"prod_unit_{new_id}", p["unit"])
+            pids_to_update_in_channel.append(new_id)
+            logger.info(f"Импортирован активный пост из канала: #{new_id} «{p['title']}» (mid={mid})")
+
+        conn.close()
+        for new_id in pids_to_update_in_channel:
+            try:
+                await sync_channel_product_post(bot, new_id)
+            except Exception as e:
+                logger.warning(f"Не удалось синхронизировать пост #{new_id}: {e}")
+    except Exception as e:
+        logger.warning(f"Ошибка в sync_channel_history_on_startup: {e}")
+
+
 # =====================================================================
 # ОБРАБОТЧИКИ СОБЫТИЙ MAX
 # =====================================================================
@@ -1091,15 +1333,19 @@ async def handle_booking_trigger(
     conn.close()
 
     if not row:
+        set_setting(f"pending_book_{user_id}", "")
+        USER_STATES.pop(user_id, None)
         if callback_id:
             await bot.answer_callback(callback_id, "Товар не найден.")
         return
 
     title, price, avail_qty = row
     if avail_qty <= 0:
+        set_setting(f"pending_book_{user_id}", "")
+        USER_STATES.pop(user_id, None)
         if callback_id:
             await bot.answer_callback(callback_id, "К сожалению, этот товар уже забронировали!")
-        await bot.send_message(f"😔 Товар **«{title}»** уже полностью забронирован.", user_id=user_id)
+            await bot.send_message(f"😔 Товар **«{title}»** уже полностью забронирован.", user_id=user_id)
         return
 
     if avail_qty == 1:
@@ -1359,6 +1605,14 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if not user_id:
             return
 
+        if payload == "cart":
+            set_setting(f"pending_book_{user_id}", "")
+            USER_STATES.pop(user_id, None)
+            await show_user_cart(bot, user_id)
+            if is_admin(user_id):
+                await show_admin_menu(bot, user_id)
+            return
+
         if payload.startswith("book_"):
             try:
                 pid = int(payload.split("_", 1)[1])
@@ -1369,11 +1623,17 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         saved_pending = get_setting(f"pending_book_{user_id}", "")
         if saved_pending.isdigit():
             set_setting(f"pending_book_{user_id}", "")
+            USER_STATES.pop(user_id, None)
             await handle_booking_trigger(bot, user_id, user_name, int(saved_pending))
+            await show_user_cart(bot, user_id)
+            if is_admin(user_id):
+                await show_admin_menu(bot, user_id)
             return
         pending = USER_STATES.get(user_id, {})
         if pending.get("state") == "await_book_qty" and pending.get("product_id"):
-            await handle_booking_trigger(bot, user_id, user_name, int(pending["product_id"]))
+            pid_pend = int(pending["product_id"])
+            USER_STATES.pop(user_id, None)
+            await handle_booking_trigger(bot, user_id, user_name, pid_pend)
             return
         await show_user_cart(bot, user_id)
         if is_admin(user_id):
@@ -1388,17 +1648,20 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         user_id = user.get("user_id")
         user_name = extract_user_display_name(user)
         user_username = user.get("username", "")
+        cb_message = upd.get("message")
         if not user_id:
             return
 
         if payload.startswith("book:"):
-            pid = int(payload.split(":", 1)[1])
+            raw_pid = int(payload.split(":", 1)[1])
+            pid = await resolve_product_from_callback(bot, raw_pid, cb_message)
             await handle_booking_trigger(bot, user_id, user_name, pid, callback_id=cb_id)
             return
 
         if payload.startswith("book_qty:"):
             _, pid_s, qty_s = payload.split(":")
-            pid, qty = int(pid_s), int(qty_s)
+            raw_pid, qty = int(pid_s), int(qty_s)
+            pid = await resolve_product_from_callback(bot, raw_pid, cb_message)
             USER_STATES.pop(user_id, None)
             set_setting(f"pending_book_{user_id}", "")
             err = await reserve_product_for_user(bot, user_id, user_name, pid, qty)
@@ -2658,7 +2921,8 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v15: прикрепление нескольких фото к товару + выбор шт./уп. + быстрые кнопки 1/2/3/5/10 под постом")
+    logger.info("Запущена версия v16: защита БД при обновлении из Git + авто-синхронизация всех постов канала без пересечения артикулов")
+    await sync_channel_history_on_startup(bot, int(ch_id))
 
     # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
     if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
