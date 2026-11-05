@@ -227,6 +227,35 @@ def get_product_unit(product_id: int) -> str:
     return val if val in ("шт.", "уп.") else "шт."
 
 
+def normalize_photo_list(
+    photo_payload: Optional[Any] = None,
+    photo_payloads: Optional[List[Any]] = None,
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+
+    def _add(item: Any) -> None:
+        if not item:
+            return
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except Exception:
+                return
+        if isinstance(item, list):
+            for sub in item:
+                _add(sub)
+        elif isinstance(item, dict):
+            clean = {"token": item["token"]} if "token" in item else item
+            if clean and clean not in result:
+                result.append(clean)
+
+    _add(photo_payload)
+    if photo_payloads:
+        for p in photo_payloads:
+            _add(p)
+    return result
+
+
 # =====================================================================
 # КЛИЕНТ MAX BOT API (platform-api.max.ru)
 # =====================================================================
@@ -308,19 +337,11 @@ class MaxBotClient:
         else:
             return None
 
-        all_photos: List[Dict[str, Any]] = []
-        if photo_payload:
-            all_photos.append(photo_payload)
-        if photo_payloads:
-            for pp in photo_payloads:
-                if pp and pp not in all_photos:
-                    all_photos.append(pp)
+        all_photos = normalize_photo_list(photo_payload, photo_payloads)
 
         attachments: List[Dict[str, Any]] = []
-        for pp in all_photos:
-            clean_photo = {"token": pp["token"]} if isinstance(pp, dict) and "token" in pp else pp
-            if clean_photo:
-                attachments.append({"type": "image", "payload": clean_photo})
+        for clean_photo in all_photos:
+            attachments.append({"type": "image", "payload": clean_photo})
         if buttons:
             attachments.append({"type": "inline_keyboard", "payload": {"buttons": buttons}})
 
@@ -332,16 +353,14 @@ class MaxBotClient:
         res = await self.request("POST", "/messages", params=params, json_body=body)
         if res is None and len(all_photos) > 1:
             # Фолбек: если несколько фото в одном сообщении не прошли, отправляем дополнительные фото отдельно, а карточку с первым фото
-            for extra_pp in all_photos[:-1]:
-                clean_extra = {"token": extra_pp["token"]} if isinstance(extra_pp, dict) and "token" in extra_pp else extra_pp
+            for clean_extra in all_photos[:-1]:
                 await self.request(
                     "POST",
                     "/messages",
                     params=params,
                     json_body={"text": "", "attachments": [{"type": "image", "payload": clean_extra}]},
                 )
-            last_pp = all_photos[-1]
-            clean_last = {"token": last_pp["token"]} if isinstance(last_pp, dict) and "token" in last_pp else last_pp
+            clean_last = all_photos[-1]
             fallback_att = [{"type": "image", "payload": clean_last}]
             if buttons:
                 fallback_att.append({"type": "inline_keyboard", "payload": {"buttons": buttons}})
@@ -358,12 +377,13 @@ class MaxBotClient:
         message_id: str,
         text: str,
         buttons: Optional[List[List[Dict[str, Any]]]] = None,
-        photo_payload: Optional[Dict[str, Any]] = None,
+        photo_payload: Optional[Any] = None,
+        photo_payloads: Optional[List[Any]] = None,
         text_format: str = "markdown",
     ) -> Optional[Dict[str, Any]]:
         attachments: List[Dict[str, Any]] = []
-        if photo_payload:
-            clean_photo = {"token": photo_payload["token"]} if "token" in photo_payload else photo_payload
+        all_photos = normalize_photo_list(photo_payload, photo_payloads)
+        for clean_photo in all_photos:
             attachments.append({"type": "image", "payload": clean_photo})
         if buttons:
             attachments.append({"type": "inline_keyboard", "payload": {"buttons": buttons}})
@@ -1574,11 +1594,11 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
         if payload == "adm:new_prod" and is_admin(user_id):
             await bot.answer_callback(cb_id)
             add_admin(user_id, user_name)
-            USER_STATES[user_id] = {"state": "adm_await_photo"}
+            USER_STATES[user_id] = {"state": "adm_await_photo", "photos": []}
             await bot.send_message(
                 text=(
-                    "📸 **Шаг 1 из 4: Фото товара**\n\n"
-                    "Отправьте фотографию товара (можно сразу с подписью-названием):"
+                    "📸 **Шаг 1 из 4: Фотографии товара (можно несколько фото!)**\n\n"
+                    "Прикрепите **1 или сразу несколько фотографий** товара (в одном сообщении или по очереди, можно сразу с подписью-названием):"
                 ),
                 user_id=user_id,
             )
@@ -2312,24 +2332,47 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 )
                 return
 
+            if state_name in ("adm_await_title", "adm_await_price", "adm_await_qty", "adm_await_unit"):
+                extra_photos = [
+                    att.get("payload")
+                    for att in attachments
+                    if att.get("type") == "image" and att.get("payload")
+                ]
+                if extra_photos:
+                    cur_photos = st.setdefault("photos", [])
+                    for ep in extra_photos:
+                        if ep not in cur_photos:
+                            cur_photos.append(ep)
+                    st["photo_payload"] = cur_photos
+                    if not text:
+                        await bot.send_message(
+                            f"📸 Добавлено фото (всего прикреплено к товару: **{len(cur_photos)} фото**).",
+                            user_id=user_id,
+                        )
+                        return
+
             if state_name == "adm_await_photo":
-                photo_payload = None
+                cur_photos = st.setdefault("photos", [])
                 for att in attachments:
-                    if att.get("type") == "image":
-                        photo_payload = att.get("payload")
-                        break
-                st["photo_payload"] = photo_payload
+                    if att.get("type") == "image" and att.get("payload"):
+                        pp = att.get("payload")
+                        if pp not in cur_photos:
+                            cur_photos.append(pp)
+                st["photo_payload"] = cur_photos
+                photo_count_str = f"📸 Прикреплено фото: **{len(cur_photos)} шт.**\n\n" if cur_photos else ""
                 if text:
                     st["title"] = text
                     st["state"] = "adm_await_price"
                     await bot.send_message(
-                        "💰 **Шаг 3 из 4: Цена товара**\n\nВведите цену за 1 шт. в рублях (только число, например `450`):",
+                        f"{photo_count_str}💰 **Шаг 3 из 4: Цена товара**\n\n"
+                        "Введите цену за 1 шт. / 1 уп. в рублях (или отправьте ещё фотографии товара):",
                         user_id=user_id,
                     )
                 else:
                     st["state"] = "adm_await_title"
                     await bot.send_message(
-                        "📝 **Шаг 2 из 4: Название и описание**\n\nВведите название и описание товара:",
+                        f"{photo_count_str}📝 **Шаг 2 из 4: Название и описание**\n\n"
+                        "Введите название и описание товара (или отправьте ещё фотографии, если нужно прикрепить несколько):",
                         user_id=user_id,
                     )
                 return
@@ -2615,7 +2658,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v14: выбор шт. или уп. при выкладке товара + кнопки быстрого выбора 1/2/3/5/10 под постом в канале")
+    logger.info("Запущена версия v15: прикрепление нескольких фото к товару + выбор шт./уп. + быстрые кнопки 1/2/3/5/10 под постом")
 
     # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
     if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
