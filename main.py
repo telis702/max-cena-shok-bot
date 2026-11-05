@@ -222,6 +222,11 @@ def format_sku(product_id: int) -> str:
     return f"АРТ-{1000 + int(product_id)}"
 
 
+def get_product_unit(product_id: int) -> str:
+    val = get_setting(f"prod_unit_{int(product_id)}", "шт.").strip()
+    return val if val in ("шт.", "уп.") else "шт."
+
+
 # =====================================================================
 # КЛИЕНТ MAX BOT API (platform-api.max.ru)
 # =====================================================================
@@ -396,20 +401,23 @@ class MaxBotClient:
 # =====================================================================
 def build_channel_post_text(product_id: int, title: str, price: int, available_qty: int) -> str:
     sku = format_sku(product_id)
+    unit = get_product_unit(product_id)
+    last_label = "последняя упаковка!" if unit == "уп." else "последний экземпляр!"
     qty_line = (
-        f"📦 **В наличии:** {available_qty} шт."
+        f"📦 **В наличии:** {available_qty} {unit}"
         if available_qty > 1
-        else "📦 **В наличии:** 1 шт. (последний экземпляр!)"
+        else f"📦 **В наличии:** 1 {unit} ({last_label})"
     )
     hint_line = (
-        "👇 **Выберите нужное количество кнопкой ниже** (1, 2, 3, 5, 10 шт.), чтобы сразу отложить товар в свою корзину:"
+        f"👇 **Выберите нужное количество кнопкой ниже** (1, 2, 3, 5, 10 {unit}), чтобы сразу отложить товар в свою корзину:"
         if available_qty > 1
         else "👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
     )
+    price_suffix = " / уп." if unit == "уп." else ""
     return (
         f"🔥 **{title}**\n"
         f"🏷 **Артикул:** `{sku}`\n\n"
-        f"💰 **Цена:** **{price} руб.**\n"
+        f"💰 **Цена:** **{price} руб.{price_suffix}**\n"
         f"{qty_line}\n\n"
         f"{hint_line}"
     )
@@ -420,12 +428,13 @@ def build_channel_post_buttons(
 ) -> List[List[Dict[str, Any]]]:
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
     cart_url = f"https://max.ru/{bot_username}?start=cart" if bot_username else manager_url
+    unit = get_product_unit(product_id)
     buttons: List[List[Dict[str, Any]]] = []
 
     if available_qty <= 1:
         buttons.append(
             [
-                {"type": "callback", "text": "🛒 Забронировать (1 шт.)", "payload": f"book_qty:{product_id}:1"},
+                {"type": "callback", "text": f"🛒 Забронировать (1 {unit})", "payload": f"book_qty:{product_id}:1"},
             ]
         )
     else:
@@ -434,18 +443,18 @@ def build_channel_post_buttons(
             preset_qtys.append(available_qty)
         quick_row = []
         for idx, q in enumerate(preset_qtys):
-            label = f"🛒 {q} шт." if idx == 0 else f"{q} шт."
+            label = f"🛒 {q} {unit}" if idx == 0 else f"{q} {unit}"
             quick_row.append({"type": "callback", "text": label, "payload": f"book_qty:{product_id}:{q}"})
         buttons.append(quick_row)
 
         other_row: List[Dict[str, Any]] = [
-            {"type": "callback", "text": f"🔢 Другое кол-во (до {available_qty} шт.)", "payload": f"book:{product_id}"}
+            {"type": "callback", "text": f"🔢 Другое кол-во (до {available_qty} {unit})", "payload": f"book:{product_id}"}
         ]
         if available_qty > 10:
             other_row.append(
                 {
                     "type": "callback",
-                    "text": f"📦 Забрать все ({available_qty} шт.)",
+                    "text": f"📦 Забрать все ({available_qty} {unit})",
                     "payload": f"book_qty:{product_id}:{available_qty}",
                 }
             )
@@ -584,8 +593,9 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
 
     for idx, it in enumerate(items, 1):
         sku = it.get("sku") or format_sku(it["product_id"])
+        unit = get_product_unit(it["product_id"])
         lines.append(
-            f"{idx}. **{it['title']}** (`{sku}`) — {it['qty']} шт. × {it['price']} руб. = **{it['subtotal']} руб.**"
+            f"{idx}. **{it['title']}** (`{sku}`) — {it['qty']} {unit} × {it['price']} руб. = **{it['subtotal']} руб.**"
         )
         if it.get("photo_payload"):
             cart_photos.append(it["photo_payload"])
@@ -593,7 +603,7 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
             [
                 {
                     "type": "callback",
-                    "text": f"❌ Отменить: {it['title'][:20]} ({it['qty']} шт.)",
+                    "text": f"❌ Отменить: {it['title'][:20]} ({it['qty']} {unit})",
                     "payload": f"cart_del:{it['product_id']}",
                 }
             ]
@@ -1099,24 +1109,25 @@ async def handle_booking_trigger(
         }
         row1: List[Dict[str, Any]] = []
         row2: List[Dict[str, Any]] = []
+        unit = get_product_unit(product_id)
         for q in range(1, min(avail_qty, 5) + 1):
-            row1.append({"type": "callback", "text": f"{q} шт.", "payload": f"book_qty:{product_id}:{q}"})
+            row1.append({"type": "callback", "text": f"{q} {unit}", "payload": f"book_qty:{product_id}:{q}"})
         for q in range(6, min(avail_qty, 10) + 1):
-            row2.append({"type": "callback", "text": f"{q} шт.", "payload": f"book_qty:{product_id}:{q}"})
+            row2.append({"type": "callback", "text": f"{q} {unit}", "payload": f"book_qty:{product_id}:{q}"})
         rows = [row1]
         if row2:
             rows.append(row2)
         if avail_qty > 10:
             rows.append(
-                [{"type": "callback", "text": f"📦 Все ({avail_qty} шт.)", "payload": f"book_qty:{product_id}:{avail_qty}"}]
+                [{"type": "callback", "text": f"📦 Все ({avail_qty} {unit})", "payload": f"book_qty:{product_id}:{avail_qty}"}]
             )
         rows.append([{"type": "callback", "text": "🛍 Открыть мою корзину", "payload": "open_cart"}])
 
         sent_prompt = await bot.send_message(
             text=(
                 f"🛒 Вы выбрали товар: **{title}**\n"
-                f"💰 Цена: **{price} руб./шт.** | 📦 Доступно в наличии: **{avail_qty} шт.**\n\n"
-                f"👇 Нажмите на кнопку с нужным количеством (от 1 до {min(avail_qty, 10)} шт.) или **напишите любое число в ответном сообщении** (от 1 до {avail_qty}):"
+                f"💰 Цена: **{price} руб./{unit}** | 📦 Доступно в наличии: **{avail_qty} {unit}**\n\n"
+                f"👇 Нажмите на кнопку с нужным количеством (от 1 до {min(avail_qty, 10)} {unit}) или **напишите любое число в ответном сообщении** (от 1 до {avail_qty}):"
             ),
             user_id=user_id,
             buttons=rows,
@@ -1574,10 +1585,13 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             return
 
         if payload.startswith("adm_qty:") and is_admin(user_id):
-            qty = int(payload.split(":", 1)[1])
+            parts = payload.split(":")
+            qty = int(parts[1])
+            unit = parts[2] if len(parts) > 2 else "шт."
             st = USER_STATES.get(user_id, {})
-            if st.get("state") == "adm_await_qty":
-                await bot.answer_callback(cb_id, f"Выбрано: {qty} шт.")
+            if st.get("state") in ("adm_await_qty", "adm_await_unit"):
+                st["unit"] = unit
+                await bot.answer_callback(cb_id, f"Выбрано: {qty} {unit}")
                 await publish_new_product_from_admin(bot, user_id, st, qty)
             return
 
@@ -2341,18 +2355,26 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                 st["state"] = "adm_await_qty"
                 await bot.send_message(
                     text=(
-                        "📦 **Шаг 4 из 4: Количество в наличии**\n\n"
-                        "Выберите количество на кнопке или напишите любое число штук в ответном сообщении:"
+                        "📦 **Шаг 4 из 4: Количество и единица измерения (штуки или упаковки)**\n\n"
+                        "Выберите готовое количество в **штуках (`шт.`)** или **упаковках (`уп.`)** кнопкой ниже, "
+                        "либо напишите любое число в ответном сообщении (например `15 шт` или `8 уп`):"
                     ),
                     user_id=user_id,
                     buttons=[
                         [
-                            {"type": "callback", "text": "1 шт.", "payload": "adm_qty:1"},
-                            {"type": "callback", "text": "2 шт.", "payload": "adm_qty:2"},
-                            {"type": "callback", "text": "3 шт.", "payload": "adm_qty:3"},
-                            {"type": "callback", "text": "5 шт.", "payload": "adm_qty:5"},
-                            {"type": "callback", "text": "10 шт.", "payload": "adm_qty:10"},
-                        ]
+                            {"type": "callback", "text": "1 шт.", "payload": "adm_qty:1:шт."},
+                            {"type": "callback", "text": "2 шт.", "payload": "adm_qty:2:шт."},
+                            {"type": "callback", "text": "3 шт.", "payload": "adm_qty:3:шт."},
+                            {"type": "callback", "text": "5 шт.", "payload": "adm_qty:5:шт."},
+                            {"type": "callback", "text": "10 шт.", "payload": "adm_qty:10:шт."},
+                        ],
+                        [
+                            {"type": "callback", "text": "1 уп.", "payload": "adm_qty:1:уп."},
+                            {"type": "callback", "text": "2 уп.", "payload": "adm_qty:2:уп."},
+                            {"type": "callback", "text": "3 уп.", "payload": "adm_qty:3:уп."},
+                            {"type": "callback", "text": "5 уп.", "payload": "adm_qty:5:уп."},
+                            {"type": "callback", "text": "10 уп.", "payload": "adm_qty:10:уп."},
+                        ],
                     ],
                 )
                 return
@@ -2360,9 +2382,30 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             if state_name == "adm_await_qty":
                 digits = "".join(ch for ch in text if ch.isdigit())
                 if not digits or int(digits) <= 0:
-                    await bot.send_message("Введите количество штук числом (например `1` или `5`):", user_id=user_id)
+                    await bot.send_message("Введите количество числом (например `5 шт` или `5 уп`):", user_id=user_id)
                     return
-                await publish_new_product_from_admin(bot, user_id, st, int(digits))
+                qty_val = int(digits)
+                low_txt = text.lower()
+                if "уп" in low_txt:
+                    st["unit"] = "уп."
+                    await publish_new_product_from_admin(bot, user_id, st, qty_val)
+                    return
+                if "шт" in low_txt:
+                    st["unit"] = "шт."
+                    await publish_new_product_from_admin(bot, user_id, st, qty_val)
+                    return
+                st["qty"] = qty_val
+                st["state"] = "adm_await_unit"
+                await bot.send_message(
+                    text=f"📦 Вы указали количество: **{qty_val}**. Выберите единицу измерения:",
+                    user_id=user_id,
+                    buttons=[
+                        [
+                            {"type": "callback", "text": f"📦 В штуках ({qty_val} шт.)", "payload": f"adm_qty:{qty_val}:шт."},
+                            {"type": "callback", "text": f"📦 В упаковках ({qty_val} уп.)", "payload": f"adm_qty:{qty_val}:уп."},
+                        ]
+                    ],
+                )
                 return
 
             if state_name == "adm_await_free_min":
@@ -2517,6 +2560,11 @@ async def publish_new_product_from_admin(
     conn.commit()
     conn.close()
 
+    unit = st.get("unit", "шт.")
+    if unit not in ("шт.", "уп."):
+        unit = "шт."
+    set_setting(f"prod_unit_{product_id}", unit)
+
     await sync_channel_product_post(bot, product_id)
     sku = format_sku(product_id)
     await bot.send_message(
@@ -2524,7 +2572,7 @@ async def publish_new_product_from_admin(
             f"✅ **Товар опубликован в канале «Цена ШОК»!**\n\n"
             f"📦 **{title}**\n"
             f"🏷 Артикул: **`{sku}`**\n"
-            f"💰 Цена: **{price} руб.** | В наличии: **{qty} шт.**"
+            f"💰 Цена: **{price} руб.** | В наличии: **{qty} {unit}**"
         ),
         user_id=admin_id,
         photo_payload=photo_payload,
@@ -2567,7 +2615,7 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v13: кнопки быстрого выбора 1/2/3/5/10 шт. прямо под постом в канале и до 10 шт. в боте")
+    logger.info("Запущена версия v14: выбор шт. или уп. при выкладке товара + кнопки быстрого выбора 1/2/3/5/10 под постом в канале")
 
     # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
     if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
