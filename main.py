@@ -401,27 +401,62 @@ def build_channel_post_text(product_id: int, title: str, price: int, available_q
         if available_qty > 1
         else "📦 **В наличии:** 1 шт. (последний экземпляр!)"
     )
+    hint_line = (
+        "👇 **Выберите нужное количество кнопкой ниже** (1, 2, 3, 5, 10 шт.), чтобы сразу отложить товар в свою корзину:"
+        if available_qty > 1
+        else "👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
+    )
     return (
         f"🔥 **{title}**\n"
         f"🏷 **Артикул:** `{sku}`\n\n"
         f"💰 **Цена:** **{price} руб.**\n"
         f"{qty_line}\n\n"
-        f"👇 Нажмите **«Забронировать»**, чтобы отложить товар в свою корзину:"
+        f"{hint_line}"
     )
 
 
-def build_channel_post_buttons(bot_username: str, product_id: int) -> List[List[Dict[str, Any]]]:
+def build_channel_post_buttons(
+    bot_username: str, product_id: int, available_qty: int = 1
+) -> List[List[Dict[str, Any]]]:
     manager_url = get_setting("manager_url", DEFAULT_MANAGER_URL)
     cart_url = f"https://max.ru/{bot_username}?start=cart" if bot_username else manager_url
-    buttons: List[List[Dict[str, Any]]] = [
-        [
-            {"type": "callback", "text": "🛒 Забронировать", "payload": f"book:{product_id}"},
-        ],
+    buttons: List[List[Dict[str, Any]]] = []
+
+    if available_qty <= 1:
+        buttons.append(
+            [
+                {"type": "callback", "text": "🛒 Забронировать (1 шт.)", "payload": f"book_qty:{product_id}:1"},
+            ]
+        )
+    else:
+        preset_qtys = [q for q in (1, 2, 3, 5, 10) if q <= available_qty]
+        if available_qty <= 10 and available_qty not in preset_qtys:
+            preset_qtys.append(available_qty)
+        quick_row = []
+        for idx, q in enumerate(preset_qtys):
+            label = f"🛒 {q} шт." if idx == 0 else f"{q} шт."
+            quick_row.append({"type": "callback", "text": label, "payload": f"book_qty:{product_id}:{q}"})
+        buttons.append(quick_row)
+
+        other_row: List[Dict[str, Any]] = [
+            {"type": "callback", "text": f"🔢 Другое кол-во (до {available_qty} шт.)", "payload": f"book:{product_id}"}
+        ]
+        if available_qty > 10:
+            other_row.append(
+                {
+                    "type": "callback",
+                    "text": f"📦 Забрать все ({available_qty} шт.)",
+                    "payload": f"book_qty:{product_id}:{available_qty}",
+                }
+            )
+        buttons.append(other_row)
+
+    buttons.append(
         [
             {"type": "link", "text": "🛍 Моя корзина", "url": cart_url},
             {"type": "link", "text": "👩‍💼 Связь с менеджером", "url": manager_url},
-        ],
-    ]
+        ]
+    )
     return buttons
 
 
@@ -453,7 +488,7 @@ async def sync_channel_product_post(bot: MaxBotClient, product_id: int) -> None:
             conn.commit()
     else:
         post_text = build_channel_post_text(pid, title, price, avail_qty)
-        buttons = build_channel_post_buttons(bot.bot_username, pid)
+        buttons = build_channel_post_buttons(bot.bot_username, pid, avail_qty)
         if msg_id:
             edited = await bot.edit_message(msg_id, post_text, buttons=buttons, photo_payload=photo_payload)
             if not edited:
@@ -1062,14 +1097,18 @@ async def handle_booking_trigger(
             "product_id": product_id,
             "user_name": user_name,
         }
-        qty_buttons: List[Dict[str, Any]] = []
-        max_btn = min(avail_qty, 5)
-        for q in range(1, max_btn + 1):
-            qty_buttons.append({"type": "callback", "text": f"{q} шт.", "payload": f"book_qty:{product_id}:{q}"})
-        rows = [qty_buttons]
-        if avail_qty > 5:
+        row1: List[Dict[str, Any]] = []
+        row2: List[Dict[str, Any]] = []
+        for q in range(1, min(avail_qty, 5) + 1):
+            row1.append({"type": "callback", "text": f"{q} шт.", "payload": f"book_qty:{product_id}:{q}"})
+        for q in range(6, min(avail_qty, 10) + 1):
+            row2.append({"type": "callback", "text": f"{q} шт.", "payload": f"book_qty:{product_id}:{q}"})
+        rows = [row1]
+        if row2:
+            rows.append(row2)
+        if avail_qty > 10:
             rows.append(
-                [{"type": "callback", "text": f"Все ({avail_qty} шт.)", "payload": f"book_qty:{product_id}:{avail_qty}"}]
+                [{"type": "callback", "text": f"📦 Все ({avail_qty} шт.)", "payload": f"book_qty:{product_id}:{avail_qty}"}]
             )
         rows.append([{"type": "callback", "text": "🛍 Открыть мою корзину", "payload": "open_cart"}])
 
@@ -1077,26 +1116,21 @@ async def handle_booking_trigger(
             text=(
                 f"🛒 Вы выбрали товар: **{title}**\n"
                 f"💰 Цена: **{price} руб./шт.** | 📦 Доступно в наличии: **{avail_qty} шт.**\n\n"
-                f"👇 Нажмите на кнопку с нужным количеством или **напишите число в ответном сообщении** (от 1 до {avail_qty}):"
+                f"👇 Нажмите на кнопку с нужным количеством (от 1 до {min(avail_qty, 10)} шт.) или **напишите любое число в ответном сообщении** (от 1 до {avail_qty}):"
             ),
             user_id=user_id,
             buttons=rows,
         )
         if sent_prompt is None:
-            # Покупатель ещё ни разу не запускал диалог с ботом (HTTP 404 Dialog not found) —
-            # сразу бронируем за ним 1 шт. и уведомляем администратора, а при входе в бот предложим выбрать доп. количество!
-            err = await reserve_product_for_user(bot, user_id, user_name, product_id, 1)
-            if not err and callback_id:
+            if callback_id:
                 await bot.answer_callback(
                     callback_id,
-                    f"✅ «{title}» (1 шт.) забронирован! Нажмите кнопку «🛍 Моя корзина» под постом, чтобы выбрать больше штук или оформить заказ.",
+                    f"👇 Нажмите сразу на кнопку с нужным числом штук (1, 2, 3, 5, 10 шт.) под постом или откройте «🛍 Моя корзина», чтобы написать своё число в боте!",
                 )
-            elif callback_id:
-                await bot.answer_callback(callback_id, err or "Ошибка бронирования")
         elif callback_id:
             await bot.answer_callback(
                 callback_id,
-                f"📩 Откройте чат с ботом (кнопка «🛍 Моя корзина»), чтобы выбрать количество товара «{title}»!",
+                f"📩 Откройте чат с ботом (кнопка «🛍 Моя корзина»), чтобы выбрать любое количество товара «{title}»!",
             )
 
 
@@ -1335,12 +1369,16 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             _, pid_s, qty_s = payload.split(":")
             pid, qty = int(pid_s), int(qty_s)
             USER_STATES.pop(user_id, None)
+            set_setting(f"pending_book_{user_id}", "")
             err = await reserve_product_for_user(bot, user_id, user_name, pid, qty)
             if err:
                 await bot.answer_callback(cb_id, err)
                 await bot.send_message(f"⚠️ {err}", user_id=user_id)
             else:
-                await bot.answer_callback(cb_id, f"✅ Добавлено в корзину: {qty} шт.!")
+                await bot.answer_callback(
+                    cb_id,
+                    f"✅ Добавлено в вашу корзину: {qty} шт.! Нажмите «🛍 Моя корзина» для оформления заказа.",
+                )
                 await bot.send_message(f"✅ Товар ({qty} шт.) добавлен в вашу корзину!", user_id=user_id)
                 await show_user_cart(bot, user_id)
             return
@@ -2529,11 +2567,11 @@ async def main() -> None:
     await bot.start()
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
-    logger.info("Запущена версия v12: уведомления об отмене брони покупателем + персональный выбор и поиск корзины отдельного человека")
+    logger.info("Запущена версия v13: кнопки быстрого выбора 1/2/3/5/10 шт. прямо под постом в канале и до 10 шт. в боте")
 
-    # Обновляем активные посты в канале с авто-артикулами АРТ-1001
-    if get_setting("notified_v10_sku_and_photos", "0") != "1":
-        set_setting("notified_v10_sku_and_photos", "1")
+    # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
+    if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
+        set_setting("notified_v13_multi_qty_buttons", "1")
         set_setting("free_delivery_min", get_setting("free_delivery_min", "1500"))
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
