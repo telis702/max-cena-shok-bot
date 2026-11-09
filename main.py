@@ -1284,10 +1284,34 @@ async def resolve_product_from_callback(
 
 async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None:
     try:
-        resp = await bot.request("GET", "/messages", params={"chat_id": ch_id, "count": 100})
-        if not resp or "messages" not in resp:
+        all_ch_msgs: List[Dict[str, Any]] = []
+        ch_from_ts: Optional[int] = None
+        for _ in range(10):
+            params: Dict[str, Any] = {"chat_id": ch_id, "count": 100}
+            if ch_from_ts is not None:
+                params["from"] = ch_from_ts
+            resp = await bot.request("GET", "/messages", params=params)
+            if not resp or "messages" not in resp:
+                break
+            batch = resp.get("messages") or []
+            if not batch:
+                break
+            all_ch_msgs.extend(batch)
+            last_ts = batch[-1].get("timestamp")
+            if not last_ts or (ch_from_ts is not None and int(last_ts) >= ch_from_ts):
+                break
+            ch_from_ts = int(last_ts)
+
+        if not all_ch_msgs:
             return
-        msgs = resp.get("messages") or []
+
+        by_mid_ch: Dict[str, Dict[str, Any]] = {}
+        for m in all_ch_msgs:
+            mid_val = (m.get("body") or {}).get("mid")
+            if mid_val:
+                by_mid_ch[str(mid_val)] = m
+
+        msgs = sorted(by_mid_ch.values(), key=lambda x: int(x.get("timestamp") or 0), reverse=True)
         max_seen_id = 60
         parsed_posts = []
         for m in msgs:
@@ -1298,16 +1322,19 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
                 if p["btn_pid"] and p["btn_pid"] > max_seen_id:
                     max_seen_id = p["btn_pid"]
                 if p["has_book_btn"]:
+                    has_legacy_1pc_btn = False
+                    for a in (m.get("body") or {}).get("attachments") or []:
+                        if a.get("type") == "inline_keyboard":
+                            for row_b in (a.get("payload") or {}).get("buttons") or []:
+                                for btn_obj in row_b:
+                                    btxt = str(btn_obj.get("text") or "")
+                                    if "Забронировать (" in btxt:
+                                        has_legacy_1pc_btn = True
+                    p["has_legacy_1pc_btn"] = has_legacy_1pc_btn
                     parsed_posts.append(p)
 
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT MAX(id) FROM products")
-        cur_max = cur.fetchone()[0] or 0
-        target_seq = max(max_seen_id, cur_max, 60)
-        cur.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
-        cur.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (target_seq,))
-        conn.commit()
 
         pids_to_update_in_channel = []
         for p in reversed(parsed_posts):
@@ -1315,19 +1342,52 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
             cur.execute("SELECT id, title FROM products WHERE channel_message_id = ?", (mid,))
             by_mid = cur.fetchone()
             if by_mid:
+                if p.get("has_legacy_1pc_btn"):
+                    pids_to_update_in_channel.append(int(by_mid[0]))
                 continue
 
             btn_pid = p["btn_pid"]
-            if btn_pid:
-                cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE id = ?", (btn_pid,))
+            sku_pid = p["sku_num"] if p["sku_num"] > 0 else None
+            desired_id = btn_pid or sku_pid
+
+            if desired_id:
+                cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE id = ?", (desired_id,))
                 by_id = cur.fetchone()
-                if by_id and _norm_title_key(by_id[1] or "") == _norm_title_key(p["title"]):
-                    if by_id[2] > 0:
-                        cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, btn_pid))
+                if by_id:
+                    if _norm_title_key(by_id[1] or "") == _norm_title_key(p["title"]):
+                        cur.execute(
+                            "UPDATE products SET channel_message_id = ?, available_qty = ? WHERE id = ?",
+                            (mid, p["avail_qty"], desired_id),
+                        )
                         conn.commit()
+                        if p.get("has_legacy_1pc_btn"):
+                            pids_to_update_in_channel.append(int(desired_id))
+                        continue
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO products (id, title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                        """,
+                        (
+                            int(desired_id),
+                            p["title"],
+                            p["price"],
+                            p["avail_qty"],
+                            p["avail_qty"],
+                            json.dumps(p["photos"], ensure_ascii=False) if p["photos"] else None,
+                            ch_id,
+                            mid,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        ),
+                    )
+                    conn.commit()
+                    set_setting(f"prod_unit_{desired_id}", p["unit"])
+                    if p.get("has_legacy_1pc_btn") or (btn_pid and sku_pid and btn_pid != sku_pid):
+                        pids_to_update_in_channel.append(int(desired_id))
+                    logger.info(f"Импортирован активный пост из канала с сохранением ID #{desired_id} «{p['title']}» (mid={mid})")
                     continue
 
-            # Проверяем по названию и цене, чтобы не создавать дубликат уже известного товара
             cur.execute("SELECT id, title, available_qty FROM products WHERE price = ? ORDER BY id DESC", (p["price"],))
             matched_existing = None
             for cid, ctitle, cavail in cur.fetchall():
@@ -1335,17 +1395,24 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
                     matched_existing = (cid, cavail)
                     break
             if matched_existing:
-                if matched_existing[1] > 0:
-                    cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, matched_existing[0]))
-                    conn.commit()
+                cur.execute(
+                    "UPDATE products SET channel_message_id = ?, available_qty = ? WHERE id = ?",
+                    (mid, p["avail_qty"], matched_existing[0]),
+                )
+                conn.commit()
+                pids_to_update_in_channel.append(int(matched_existing[0]))
                 continue
 
+            cur.execute("SELECT MAX(id) FROM products")
+            cur_max_now = cur.fetchone()[0] or 0
+            next_safe_id = max(max_seen_id, cur_max_now, 60) + 1
             cur.execute(
                 """
-                INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                INSERT INTO products (id, title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
+                    next_safe_id,
                     p["title"],
                     p["price"],
                     p["avail_qty"],
@@ -1356,13 +1423,21 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
-            new_id = int(cur.lastrowid)
+            new_id = int(next_safe_id)
+            max_seen_id = max(max_seen_id, new_id)
             conn.commit()
             set_setting(f"prod_unit_{new_id}", p["unit"])
             pids_to_update_in_channel.append(new_id)
             logger.info(f"Импортирован активный пост из канала: #{new_id} «{p['title']}» (mid={mid})")
 
+        cur.execute("SELECT MAX(id) FROM products")
+        final_max = cur.fetchone()[0] or 0
+        target_seq = max(max_seen_id, final_max, 60)
+        cur.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
+        cur.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (target_seq,))
+        conn.commit()
         conn.close()
+
         for new_id in pids_to_update_in_channel:
             try:
                 await sync_channel_product_post(bot, new_id)
@@ -1373,12 +1448,13 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
 
 
 def _norm_title_key(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+    cleaned = (s or "").replace("*", "").replace("`", "").replace("«", "").replace("»", "")
+    return re.sub(r"\s+", " ", cleaned.strip()).lower()
 
 
 async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None:
-    """Единоразово восстанавливает и объединяет все прошлые брони покупателей из истории чата с админом."""
-    if get_setting("history_merged_v17", "0") == "1":
+    """Полностью восстанавливает актуальные корзины, статусы сборки и заказы из всей истории чата с админом."""
+    if get_setting("history_merged_v19", "0") == "1":
         return
 
     try:
@@ -1387,7 +1463,7 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
         all_msgs: List[Dict[str, Any]] = []
         from_ts: Optional[int] = None
 
-        for _ in range(15):
+        for _ in range(250):
             params: Dict[str, Any] = {"chat_id": dialog_chat_id, "count": 100}
             if from_ts is not None:
                 params["from"] = from_ts
@@ -1399,7 +1475,7 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                 break
             all_msgs.extend(msgs)
             last_ts = msgs[-1].get("timestamp")
-            if not last_ts or len(msgs) < 100:
+            if not last_ts or (from_ts is not None and int(last_ts) >= from_ts):
                 break
             from_ts = int(last_ts)
 
@@ -1410,10 +1486,18 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
         for m in all_msgs:
             mid = (m.get("body") or {}).get("mid")
             if mid:
-                by_mid[mid] = m
+                by_mid[str(mid)] = m
 
-        sorted_msgs = sorted(by_mid.values(), key=lambda x: x.get("timestamp", 0))
+        sorted_msgs = sorted(
+            by_mid.values(),
+            key=lambda x: (int(x.get("timestamp") or 0), str((x.get("body") or {}).get("mid") or "")),
+        )
         carts: Dict[int, Dict[str, Any]] = {}
+        packed_users: set[int] = set()
+        recent_views: List[Tuple[int, int, str]] = []
+        orders_map: Dict[int, Dict[str, Any]] = {}
+        latest_free_delivery: Optional[str] = None
+        latest_delivery_dates: Optional[str] = None
 
         for m in sorted_msgs:
             ts = int(m.get("timestamp") or 0)
@@ -1432,7 +1516,33 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                     elif "url" in pl:
                         msg_photos.append({"url": pl["url"]})
 
-            if "🛒 НОВАЯ БРОНЬ В КАНАЛЕ" in text:
+            m_fd = re.search(r"Порог бесплатной доставки обновлён:\s*(?:\*\*)?от\s*(\d+)\s*руб", text)
+            if m_fd:
+                latest_free_delivery = m_fd.group(1)
+            elif "Панель управления магазином" in text:
+                m_fd2 = re.search(r"Бесплатная доставка:(?:\*\*)?\s*от\s*(?:\*\*)?(\d+)\s*руб", text)
+                if m_fd2:
+                    latest_free_delivery = m_fd2.group(1)
+                m_dd = re.search(r"Даты доставки:(?:\*\*)?\s*(.+)", text)
+                if m_dd:
+                    dd_val = m_dd.group(1).strip()
+                    latest_delivery_dates = "" if "По согласованию" in dd_val else dd_val
+            if "Открытые даты отключены" in text:
+                latest_delivery_dates = ""
+
+            if "Все неоформленные брони из корзин сняты" in text:
+                for u_data in carts.values():
+                    u_data["items"] = []
+                packed_users.clear()
+                continue
+
+            if "Корзина покупателя" in text and "🛒" in text:
+                m_vuid = re.search(r"ID\s+`?(\d+)`?", text)
+                if m_vuid:
+                    recent_views.append((ts, int(m_vuid.group(1)), _norm_title_key(text)))
+                continue
+
+            if "🛒" in text and "НОВАЯ БРОНЬ В КАНАЛЕ" in text:
                 m_uid = re.search(r"ID\s+`?(\d+)`?", text)
                 if not m_uid:
                     continue
@@ -1455,9 +1565,10 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                 )
                 if not m_details:
                     continue
-                raw_title = m_details.group(1).strip().strip("*")
+                raw_title = m_details.group(1).strip().strip("*").strip()
                 if "тестирование бота" in raw_title.lower():
                     continue
+                sku_num = int(m_details.group(2)) - 1000 if m_details.group(2) and int(m_details.group(2)) > 1000 else 0
                 qty = int(m_details.group(3))
                 unit = m_details.group(4)
                 price = int(float(m_details.group(5).replace(" ", "").replace(",", ".")))
@@ -1473,10 +1584,14 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                     None,
                 )
                 if existing:
+                    if qty == 1 and (ts - int(existing.get("last_add_ts") or 0)) < 3000:
+                        continue
                     existing["qty"] += qty
                     if item_photo and not existing["photo"]:
                         existing["photo"] = item_photo
-                    existing["ts"] = ts
+                    if sku_num and not existing.get("sku_num"):
+                        existing["sku_num"] = sku_num
+                    existing["last_add_ts"] = ts
                 else:
                     carts[uid]["items"].append(
                         {
@@ -1484,12 +1599,14 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                             "qty": qty,
                             "price": price,
                             "unit": unit,
+                            "sku_num": sku_num,
                             "photo": item_photo,
-                            "ts": ts,
+                            "first_ts": ts,
+                            "last_add_ts": ts,
                         }
                     )
 
-            elif "⚠️ ОТМЕНА БРОНИ ПОКУПАТЕЛЕМ!" in text:
+            elif "ОТМЕНА БРОНИ ПОКУПАТЕЛЕМ" in text:
                 m_uid = re.search(r"ID\s+`?(\d+)`?", text)
                 if not m_uid:
                     continue
@@ -1498,6 +1615,7 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                     continue
                 if "Корзина покупателя теперь полностью пуста" in text:
                     carts[uid]["items"] = []
+                    packed_users.discard(uid)
                 else:
                     m_ret = re.search(r"Товар «(.+?)»\s*\([^,]+,\s*(\d+)\s*(?:шт\.|уп\.)\)", text, re.S)
                     if m_ret:
@@ -1509,84 +1627,197 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                                 if it["qty"] <= 0:
                                     carts[uid]["items"].remove(it)
                                 break
+                        if not carts[uid]["items"]:
+                            packed_users.discard(uid)
 
-            elif "⚠️ ПОКУПАТЕЛЬ ПОЛНОСТЬЮ ОТМЕНИЛ БРОНЬ" in text:
+            elif "Бронь на «" in text and "отменена" in text:
                 m_uid = re.search(r"ID\s+`?(\d+)`?", text)
-                if m_uid and int(m_uid.group(1)) in carts:
-                    carts[int(m_uid.group(1))]["items"] = []
-
-            elif "принудительно расформирована" in text:
-                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
-                if m_uid and int(m_uid.group(1)) in carts:
-                    carts[int(m_uid.group(1))]["items"] = []
-
-            elif "Частичное удаление из корзины:" in text:
-                m_uid = re.search(r"Покупатель ID\s+`?(\d+)`?", text)
-                m_t = re.search(r"убрана 1 (?:шт\.|уп\.) товара «(.+?)»", text, re.S)
-                if m_uid and m_t and int(m_uid.group(1)) in carts:
+                m_ret = re.search(r"Бронь на «(.+?)»\s*\((\d+)", text, re.S)
+                if m_uid and m_ret:
                     uid = int(m_uid.group(1))
+                    if uid in carts:
+                        r_title = m_ret.group(1).strip()
+                        r_qty = int(m_ret.group(2))
+                        for it in list(carts[uid]["items"]):
+                            if _norm_title_key(it["title"]) == _norm_title_key(r_title):
+                                it["qty"] -= r_qty
+                                if it["qty"] <= 0:
+                                    carts[uid]["items"].remove(it)
+                                break
+                        if not carts[uid]["items"]:
+                            packed_users.discard(uid)
+
+            elif "ПОКУПАТЕЛЬ ПОЛНОСТЬЮ ОТМЕНИЛ БРОНЬ" in text:
+                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
+                if m_uid:
+                    uid = int(m_uid.group(1))
+                    if uid in carts:
+                        carts[uid]["items"] = []
+                    packed_users.discard(uid)
+
+            elif "принудительно расформирована" in text or "Авто-расформирование корзины" in text:
+                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
+                if m_uid:
+                    uid = int(m_uid.group(1))
+                    if uid in carts:
+                        carts[uid]["items"] = []
+                    packed_users.discard(uid)
+
+            elif "Статус корзины покупателя" in text and "Корзина собрана" in text:
+                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
+                if m_uid:
+                    packed_users.add(int(m_uid.group(1)))
+
+            elif "Частичное удаление из корзины" in text:
+                m_t = re.search(r"Товар «(.+?)»\s*\([^,]+,\s*(\d+)\s*(?:шт\.|уп\.)\)", text, re.S)
+                r_title = ""
+                r_qty = 1
+                if m_t:
                     r_title = m_t.group(1).strip()
-                    for it in list(carts[uid]["items"]):
-                        if _norm_title_key(it["title"]) == _norm_title_key(r_title):
-                            it["qty"] -= 1
-                            if it["qty"] <= 0:
-                                carts[uid]["items"].remove(it)
+                    r_qty = int(m_t.group(2))
+                else:
+                    m_t2 = re.search(r"убрана\s+(\d+)\s*(?:шт\.|уп\.)\s*товара\s*«(.+?)»", text, re.S)
+                    if m_t2:
+                        r_qty = int(m_t2.group(1))
+                        r_title = m_t2.group(2).strip()
+
+                if not r_title:
+                    continue
+                norm_r_title = _norm_title_key(r_title)
+
+                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
+                target_uid: Optional[int] = int(m_uid.group(1)) if m_uid else None
+
+                if target_uid is None:
+                    for v_ts, v_uid, v_norm_text in reversed(recent_views):
+                        if 0 <= (ts - v_ts) <= 1800000 and norm_r_title in v_norm_text:
+                            target_uid = v_uid
                             break
 
-            elif "Товар выдан, заказ №" in text:
+                if target_uid is None:
+                    holders = [
+                        u_k
+                        for u_k, u_d in carts.items()
+                        if any(_norm_title_key(x["title"]) == norm_r_title and x["qty"] > 0 for x in u_d.get("items", []))
+                    ]
+                    if holders:
+                        target_uid = holders[-1]
+
+                if target_uid is not None and target_uid in carts:
+                    for it in list(carts[target_uid]["items"]):
+                        if _norm_title_key(it["title"]) == norm_r_title:
+                            it["qty"] -= r_qty
+                            if it["qty"] <= 0:
+                                carts[target_uid]["items"].remove(it)
+                            break
+                    if not carts[target_uid]["items"]:
+                        packed_users.discard(target_uid)
+
+            elif "НОВЫЙ ЗАКАЗ №" in text:
+                m_oid = re.search(r"НОВЫЙ ЗАКАЗ №(\d+)", text)
                 m_uid = re.search(r"ID\s+`?(\d+)`?", text)
-                if m_uid and int(m_uid.group(1)) in carts:
-                    carts[int(m_uid.group(1))]["items"] = []
+                if m_oid and m_uid:
+                    oid = int(m_oid.group(1))
+                    uid = int(m_uid.group(1))
+                    b_name = (carts.get(uid) or {}).get("name") or f"Покупатель {uid}"
+                    m_ph = re.search(r"Телефон / комментарий:(?:\*\*)?\s*(.+)", text)
+                    phone_val = m_ph.group(1).strip() if m_ph else ""
+                    m_tot = re.search(r"Сумма заказа:(?:\*\*)?\s*(?:\*\*)?(\d+)", text)
+                    tot_val = int(m_tot.group(1)) if m_tot else 0
+                    snap_items = list((carts.get(uid) or {}).get("items") or [])
+                    orders_map[oid] = {
+                        "id": oid,
+                        "user_id": uid,
+                        "user_name": b_name,
+                        "phone": phone_val,
+                        "addr": "Оформлен через бота",
+                        "total": tot_val or sum(x["qty"] * x["price"] for x in snap_items),
+                        "items": [dict(x) for x in snap_items],
+                        "status": "new",
+                        "ts": ts,
+                    }
+                    if uid in carts:
+                        carts[uid]["items"] = []
+                    packed_users.discard(uid)
+
+            elif "Товар выдан, заказ №" in text:
+                m_oid = re.search(r"заказ №(\d+)", text)
+                m_uid = re.search(r"ID\s+`?(\d+)`?", text)
+                if m_uid:
+                    uid = int(m_uid.group(1))
+                    b_name = (carts.get(uid) or {}).get("name") or f"Покупатель {uid}"
+                    snap_items = list((carts.get(uid) or {}).get("items") or [])
+                    m_tot = re.search(r"Сумма:\s*(?:\*\*)?(\d+)", text)
+                    tot_val = int(m_tot.group(1)) if m_tot else sum(x["qty"] * x["price"] for x in snap_items)
+                    if m_oid:
+                        oid = int(m_oid.group(1))
+                        orders_map[oid] = {
+                            "id": oid,
+                            "user_id": uid,
+                            "user_name": b_name,
+                            "phone": "Выдан из корзины",
+                            "addr": "Самовывоз / Выдан администратором",
+                            "total": tot_val,
+                            "items": [dict(x) for x in snap_items],
+                            "status": "done",
+                            "ts": ts,
+                        }
+                    if uid in carts:
+                        carts[uid]["items"] = []
+                    packed_users.discard(uid)
+
+            elif "отмечен как" in text and "Корзина собрана" in text and "Заказ" in text:
+                m_oid = re.search(r"№(\d+)", text)
+                if m_oid and int(m_oid.group(1)) in orders_map:
+                    orders_map[int(m_oid.group(1))]["status"] = "packed"
+
+            elif "Заказ №" in text and "успешно закрыт" in text:
+                m_oid = re.search(r"Заказ №(\d+)", text)
+                if m_oid and int(m_oid.group(1)) in orders_map:
+                    orders_map[int(m_oid.group(1))]["status"] = "done"
+
+            elif "Заказ №" in text and "отменён" in text:
+                m_oid = re.search(r"Заказ №(\d+)", text)
+                if m_oid and int(m_oid.group(1)) in orders_map:
+                    orders_map[int(m_oid.group(1))]["status"] = "cancelled"
+
+        if latest_free_delivery:
+            set_setting("free_delivery_min", latest_free_delivery)
+        if latest_delivery_dates is not None:
+            set_setting("delivery_dates", latest_delivery_dates)
 
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
+
+        cur.execute("DELETE FROM cart_items")
+        cur.execute("DELETE FROM settings WHERE key LIKE 'cart_packed_%'")
+
         merged_buyers = 0
         merged_items = 0
 
         for uid, data in carts.items():
-            items_list = data.get("items") or []
+            items_list = [x for x in (data.get("items") or []) if int(x.get("qty") or 0) > 0]
             if not items_list:
                 continue
             b_name = data.get("name") or f"Покупатель {uid}"
             merged_buyers += 1
 
-            cur.execute(
-                """
-                SELECT c.id, c.product_id, c.qty, p.title, p.photo_payload
-                FROM cart_items c
-                JOIN products p ON p.id = c.product_id
-                WHERE c.user_id = ?
-                """,
-                (uid,),
-            )
-            current_rows = cur.fetchall()
-
             for it in items_list:
                 norm_t = _norm_title_key(it["title"])
-                matched_row = next(
-                    (r for r in current_rows if _norm_title_key(r[3]) == norm_t),
-                    None,
+                first_ts_ms = int(it.get("first_ts") or 0)
+                created_str = (
+                    datetime.fromtimestamp(first_ts_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                    if first_ts_ms > 0
+                    else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
-                created_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                if matched_row:
-                    cid, pid, cur_qty, _, cur_photo = matched_row
-                    new_qty = max(int(cur_qty), int(it["qty"]))
-                    cur.execute(
-                        "UPDATE cart_items SET qty = ?, user_name = ? WHERE id = ?",
-                        (new_qty, b_name, cid),
-                    )
-                    if not cur_photo and it["photo"]:
-                        cur.execute(
-                            "UPDATE products SET photo_payload = ? WHERE id = ?",
-                            (json.dumps(it["photo"], ensure_ascii=False), pid),
-                        )
-                    merged_items += 1
-                    continue
-
-                # Ищем товар в products по названию и цене
                 cur.execute(
-                    "SELECT id, title, photo_payload FROM products WHERE price = ? ORDER BY id DESC",
+                    """
+                    SELECT id, title, photo_payload
+                    FROM products
+                    WHERE price = ?
+                    ORDER BY CASE WHEN channel_message_id IS NOT NULL THEN 0 ELSE 1 END, id DESC
+                    """,
                     (it["price"],),
                 )
                 prod_candidates = cur.fetchall()
@@ -1602,21 +1833,45 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                             (json.dumps(it["photo"], ensure_ascii=False), pid),
                         )
                 else:
-                    cur.execute(
-                        """
-                        INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, is_active, created_at)
-                        VALUES (?, ?, ?, 0, ?, ?, 1, ?)
-                        """,
-                        (
-                            it["title"],
-                            it["price"],
-                            it["qty"],
-                            json.dumps(it["photo"], ensure_ascii=False) if it["photo"] else None,
-                            DEFAULT_CHANNEL_CHAT_ID,
-                            created_str,
-                        ),
-                    )
-                    pid = int(cur.lastrowid)
+                    desired_sku_id = int(it.get("sku_num") or 0)
+                    can_use_sku_id = False
+                    if desired_sku_id > 0:
+                        cur.execute("SELECT 1 FROM products WHERE id = ?", (desired_sku_id,))
+                        can_use_sku_id = cur.fetchone() is None
+
+                    if can_use_sku_id:
+                        cur.execute(
+                            """
+                            INSERT INTO products (id, title, price, total_qty, available_qty, photo_payload, channel_chat_id, is_active, created_at)
+                            VALUES (?, ?, ?, ?, 0, ?, ?, 1, ?)
+                            """,
+                            (
+                                desired_sku_id,
+                                it["title"],
+                                it["price"],
+                                it["qty"],
+                                json.dumps(it["photo"], ensure_ascii=False) if it["photo"] else None,
+                                DEFAULT_CHANNEL_CHAT_ID,
+                                created_str,
+                            ),
+                        )
+                        pid = desired_sku_id
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, is_active, created_at)
+                            VALUES (?, ?, ?, 0, ?, ?, 1, ?)
+                            """,
+                            (
+                                it["title"],
+                                it["price"],
+                                it["qty"],
+                                json.dumps(it["photo"], ensure_ascii=False) if it["photo"] else None,
+                                DEFAULT_CHANNEL_CHAT_ID,
+                                created_str,
+                            ),
+                        )
+                        pid = int(cur.lastrowid)
                     cur.execute(
                         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                         (f"prod_unit_{pid}", it["unit"]),
@@ -1627,18 +1882,86 @@ async def reconstruct_carts_from_admin_dialog_history(bot: MaxBotClient) -> None
                     INSERT INTO cart_items (user_id, user_name, product_id, qty, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, product_id) DO UPDATE SET
-                        qty = MAX(cart_items.qty, excluded.qty),
+                        qty = cart_items.qty + excluded.qty,
                         user_name = excluded.user_name
                     """,
                     (uid, b_name, pid, it["qty"], created_str),
                 )
                 merged_items += 1
 
+        cur.execute(
+            """
+            UPDATE products
+            SET total_qty = MAX(
+                total_qty,
+                available_qty + COALESCE((SELECT SUM(c.qty) FROM cart_items c WHERE c.product_id = products.id), 0)
+            )
+            """
+        )
+
+        for p_uid in packed_users:
+            cur.execute("SELECT 1 FROM cart_items WHERE user_id = ?", (p_uid,))
+            if cur.fetchone():
+                cur.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                    (f"cart_packed_{p_uid}",),
+                )
+
+        for oid, odata in sorted(orders_map.items()):
+            o_created = (
+                datetime.fromtimestamp(int(odata["ts"]) / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                if odata.get("ts")
+                else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+            o_items_payload = []
+            for oit in odata.get("items") or []:
+                o_sku_id = int(oit.get("sku_num") or 0)
+                o_items_payload.append(
+                    {
+                        "product_id": o_sku_id,
+                        "sku": format_sku(o_sku_id) if o_sku_id > 0 else "АРТ",
+                        "title": oit["title"],
+                        "price": oit["price"],
+                        "qty": oit["qty"],
+                        "subtotal": oit["qty"] * oit["price"],
+                        "photo_payload": oit["photo"][0] if oit.get("photo") else None,
+                    }
+                )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO orders (id, user_id, user_name, user_username, phone, delivery_type, delivery_address, total_amount, items_json, status, created_at)
+                VALUES (?, ?, ?, '', ?, 'pickup', ?, ?, ?, ?, ?)
+                """,
+                (
+                    oid,
+                    odata["user_id"],
+                    odata["user_name"],
+                    odata["phone"],
+                    odata["addr"],
+                    odata["total"],
+                    json.dumps(o_items_payload, ensure_ascii=False),
+                    odata["status"],
+                    o_created,
+                ),
+            )
+
+        cur.execute("SELECT MAX(id) FROM products")
+        p_max = cur.fetchone()[0] or 0
+        if p_max > 0:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name = 'products'")
+            cur.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('products', ?)", (max(p_max, 60),))
+
+        cur.execute("SELECT MAX(id) FROM orders")
+        o_max = cur.fetchone()[0] or 0
+        if o_max > 0:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name = 'orders'")
+            cur.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('orders', ?)", (o_max,))
+
         conn.commit()
         conn.close()
-        set_setting("history_merged_v17", "1")
+        set_setting("history_merged_v19", "1")
         logger.info(
-            f"Авто-объединение корзин из истории чата завершено: покупателей={merged_buyers}, позиций={merged_items}"
+            f"Авто-восстановление корзин v19 завершено: сообщений={len(sorted_msgs)}, покупателей={merged_buyers}, позиций={merged_items}, заказов={len(orders_map)}"
         )
     except Exception as e:
         logger.warning(f"Ошибка в reconstruct_carts_from_admin_dialog_history: {e}")
@@ -2292,56 +2615,15 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                     )
                 return
 
-            # Если корзин несколько — показываем удобный выбор конкретного покупателя без вываливания всех чужих броней разом
-            first_batch = buyer_rows[:24]
-            second_batch = buyer_rows[24:50]
-
-            selector_btns = []
-            for buid, bname, total_qty, total_sum in first_batch:
-                disp_name = (bname or f"ID {buid}")[:18]
-                packed_mark = "📦 " if get_setting(f"cart_packed_{buid}", "0") == "1" else "🛒 "
-                selector_btns.append(
-                    [
-                        {
-                            "type": "callback",
-                            "text": f"{packed_mark}{disp_name} — {total_qty} шт. ({total_sum} руб.)",
-                            "payload": f"adm_view_cart:{buid}",
-                        }
-                    ]
-                )
-            if not second_batch:
-                selector_btns.append(
-                    [{"type": "callback", "text": "🔍 Найти корзину по имени / ID", "payload": "adm:search_cart"}]
-                )
-                selector_btns.append(
-                    [{"type": "callback", "text": "📋 Показать все корзины подряд", "payload": "adm:active_carts_all"}]
-                )
-                selector_btns.append(
-                    [
-                        {
-                            "type": "callback",
-                            "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
-                            "payload": "adm:clear_all_carts",
-                        }
-                    ]
-                )
-
-            await bot.send_message(
-                text=(
-                    f"🛒 **Активные корзины покупателей ({len(buyer_rows)} чел.)**\n\n"
-                    "👇 Нажмите на нужного покупателя в списке ниже, чтобы открыть **только его корзину** (без списка всех остальных людей), "
-                    "или просто **напишите имя / ID покупателя** прямо в чат:"
-                ),
-                user_id=user_id,
-                buttons=selector_btns,
-            )
-
-            if second_batch:
-                more_btns = []
-                for buid, bname, total_qty, total_sum in second_batch:
+            # Если корзин несколько — показываем удобный выбор конкретного покупателя пачками по 24 кнопки (под любое количество людей!)
+            chunk_size = 24
+            chunks = [buyer_rows[i : i + chunk_size] for i in range(0, len(buyer_rows), chunk_size)]
+            for idx_chunk, batch in enumerate(chunks):
+                batch_btns = []
+                for buid, bname, total_qty, total_sum in batch:
                     disp_name = (bname or f"ID {buid}")[:18]
                     packed_mark = "📦 " if get_setting(f"cart_packed_{buid}", "0") == "1" else "🛒 "
-                    more_btns.append(
+                    batch_btns.append(
                         [
                             {
                                 "type": "callback",
@@ -2350,25 +2632,38 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
                             }
                         ]
                     )
-                more_btns.append(
-                    [{"type": "callback", "text": "🔍 Найти корзину по имени / ID", "payload": "adm:search_cart"}]
-                )
-                more_btns.append(
-                    [{"type": "callback", "text": "📋 Показать все корзины подряд", "payload": "adm:active_carts_all"}]
-                )
-                more_btns.append(
-                    [
-                        {
-                            "type": "callback",
-                            "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
-                            "payload": "adm:clear_all_carts",
-                        }
-                    ]
-                )
+                if idx_chunk == len(chunks) - 1:
+                    batch_btns.append(
+                        [{"type": "callback", "text": "🔍 Найти корзину по имени / ID", "payload": "adm:search_cart"}]
+                    )
+                    batch_btns.append(
+                        [{"type": "callback", "text": "📋 Показать все корзины подряд", "payload": "adm:active_carts_all"}]
+                    )
+                    batch_btns.append(
+                        [
+                            {
+                                "type": "callback",
+                                "text": "🔄 Расформировать ВСЕ корзины и вернуть в канал",
+                                "payload": "adm:clear_all_carts",
+                            }
+                        ]
+                    )
+
+                if idx_chunk == 0:
+                    msg_hdr = (
+                        f"🛒 **Активные корзины покупателей ({len(buyer_rows)} чел.)**\n\n"
+                        "👇 Нажмите на нужного покупателя в списке ниже, чтобы открыть **только его корзину** (без списка всех остальных людей), "
+                        "или просто **напишите имя / ID покупателя** прямо в чат:"
+                    )
+                else:
+                    start_num = idx_chunk * chunk_size + 1
+                    end_num = start_num + len(batch) - 1
+                    msg_hdr = f"📋 **Продолжение списка активных корзин ({start_num}–{end_num} из {len(buyer_rows)}):**"
+
                 await bot.send_message(
-                    text=f"📋 **Продолжение списка активных корзин ({len(first_batch) + 1}–{len(first_batch) + len(second_batch)} из {len(buyer_rows)}):**",
+                    text=msg_hdr,
                     user_id=user_id,
-                    buttons=more_btns,
+                    buttons=batch_btns,
                 )
             return
 
@@ -2557,7 +2852,7 @@ async def process_update(bot: MaxBotClient, upd: Dict[str, Any]) -> None:
             if msg:
                 await bot.answer_callback(cb_id, "1 шт. убрана из корзины и возвращена в канал!")
                 await bot.send_message(
-                    f"✅ **Частичное удаление из корзины:**\n{msg}\nОстальные товары в корзине покупателя сохранены.",
+                    f"✅ **Частичное удаление из корзины (Покупатель ID `{buyer_id}`):**\n{msg}\nОстальные товары в корзине покупателя сохранены.",
                     user_id=user_id,
                 )
             else:
@@ -3290,7 +3585,7 @@ async def main() -> None:
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
     logger.info(
-        "Запущена версия v18: защита от задвоения товаров при возвратах/двойном клике + кнопка «🛒 Забронировать» без «1 шт.»"
+        "Запущена версия v19: полная синхронизация всех корзин (до 25 000 сообщений без обрезки на 1500) + точный учёт частичных удалений и статусов"
     )
     await sync_channel_history_on_startup(bot, int(ch_id))
     await reconstruct_carts_from_admin_dialog_history(bot)
@@ -3312,43 +3607,14 @@ async def main() -> None:
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.warning(f"Ошибка авто-коррекции задвоенных корзин v18: {e}")
+        logger.warning(f"Ошибка авто-коррекции задвоенных корзин v19: {e}")
 
-    # Обновляем активные посты в канале (кнопка «🛒 Забронировать» без «1 шт.»)
-    if get_setting("notified_v18_clean_btn", "0") != "1":
-        set_setting("notified_v18_clean_btn", "1")
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0 AND channel_message_id IS NOT NULL")
-        active_pids = [r[0] for r in cur.fetchall()]
-        conn.close()
-        for pid in active_pids:
-            try:
-                await sync_channel_product_post(bot, pid)
-            except Exception as e:
-                logger.warning(f"Не удалось обновить кнопку поста #{pid}: {e}")
-
-    # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
-    if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
-        set_setting("notified_v13_multi_qty_buttons", "1")
-        set_setting("free_delivery_min", get_setting("free_delivery_min", "1500"))
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0")
-        active_pids = [r[0] for r in cur.fetchall()]
-        conn.close()
-        for pid in active_pids:
-            try:
-                await sync_channel_product_post(bot, pid)
-            except Exception as e:
-                logger.warning(f"Не удалось обновить пост #{pid}: {e}")
-
-    if get_setting("notified_v12_cancel_and_search", "0") != "1":
-        set_setting("notified_v12_cancel_and_search", "1")
+    if get_setting("notified_v19_ready", "0") != "1":
+        set_setting("notified_v19_ready", "1")
         try:
             await show_admin_menu(bot, 24725732)
         except Exception as e:
-            logger.warning(f"Не удалось отправить обновлённое меню v12: {e}")
+            logger.warning(f"Не удалось отправить обновлённое меню v19: {e}")
 
     guard_task = asyncio.create_task(webhook_guard_loop(bot))
     expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
