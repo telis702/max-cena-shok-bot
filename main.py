@@ -469,7 +469,7 @@ def build_channel_post_buttons(
     if available_qty <= 1:
         buttons.append(
             [
-                {"type": "callback", "text": f"🛒 Забронировать (1 {unit})", "payload": f"book_qty:{product_id}:1"},
+                {"type": "callback", "text": "🛒 Забронировать", "payload": f"book_qty:{product_id}:1"},
             ]
         )
     else:
@@ -682,6 +682,17 @@ async def show_user_cart(bot: MaxBotClient, user_id: int) -> None:
     )
 
 
+PRODUCT_LOCKS: Dict[int, asyncio.Lock] = {}
+RECENT_BOOK_CLICKS: Dict[tuple, float] = {}
+
+
+def get_product_lock(product_id: int) -> asyncio.Lock:
+    pid = int(product_id)
+    if pid not in PRODUCT_LOCKS:
+        PRODUCT_LOCKS[pid] = asyncio.Lock()
+    return PRODUCT_LOCKS[pid]
+
+
 async def reserve_product_for_user(
     bot: MaxBotClient,
     user_id: int,
@@ -689,36 +700,54 @@ async def reserve_product_for_user(
     product_id: int,
     qty_to_add: int,
 ) -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT title, price, available_qty FROM products WHERE id = ?", (product_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return "Товар не найден."
+    lock = get_product_lock(product_id)
+    async with lock:
+        now_ts = asyncio.get_event_loop().time()
+        click_key = (int(user_id), int(product_id))
+        last_click = RECENT_BOOK_CLICKS.get(click_key, 0.0)
+        if now_ts - last_click < 2.2:
+            return "Бронь уже обрабатывается, подождите пару секунд."
+        RECENT_BOOK_CLICKS[click_key] = now_ts
 
-    title, price, avail_qty = row
-    if avail_qty <= 0:
-        conn.close()
-        return f"К сожалению, товар «{title}» уже полностью забронировали."
-    if qty_to_add > avail_qty:
-        conn.close()
-        return f"В наличии осталось только {avail_qty} шт. товара «{title}». Введите количество от 1 до {avail_qty}."
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT title, price, total_qty, available_qty FROM products WHERE id = ?", (product_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return "Товар не найден."
 
-    new_avail = avail_qty - qty_to_add
-    cur.execute("UPDATE products SET available_qty = ? WHERE id = ?", (new_avail, product_id))
-    cur.execute(
-        """
-        INSERT INTO cart_items (user_id, user_name, product_id, qty, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, product_id) DO UPDATE SET qty = qty + excluded.qty
-        """,
-        (user_id, user_name, product_id, qty_to_add, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    conn.commit()
-    conn.close()
+        title, price, total_qty, avail_qty = row
+        cur.execute("SELECT COALESCE(SUM(qty), 0) FROM cart_items WHERE product_id = ?", (product_id,))
+        in_carts = int(cur.fetchone()[0] or 0)
+        real_max_avail = max(0, int(total_qty or 1) - in_carts)
+        if avail_qty > real_max_avail:
+            avail_qty = real_max_avail
+            cur.execute("UPDATE products SET available_qty = ? WHERE id = ?", (avail_qty, product_id))
+            conn.commit()
 
-    await sync_channel_product_post(bot, product_id)
+        if avail_qty <= 0:
+            conn.close()
+            await sync_channel_product_post(bot, product_id)
+            return f"К сожалению, товар «{title}» уже полностью забронировали."
+        if qty_to_add > avail_qty:
+            conn.close()
+            return f"В наличии осталось только {avail_qty} шт. товара «{title}». Введите количество от 1 до {avail_qty}."
+
+        new_avail = avail_qty - qty_to_add
+        cur.execute("UPDATE products SET available_qty = ? WHERE id = ?", (new_avail, product_id))
+        cur.execute(
+            """
+            INSERT INTO cart_items (user_id, user_name, product_id, qty, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, product_id) DO UPDATE SET qty = MIN(?, cart_items.qty + excluded.qty)
+            """,
+            (user_id, user_name, product_id, qty_to_add, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), int(total_qty or 1)),
+        )
+        conn.commit()
+        conn.close()
+
+        await sync_channel_product_post(bot, product_id)
 
     # Мгновенное уведомление администраторам о новой брони + полный список корзины покупателя с фото и артикулами
     buyer_mention = format_buyer_mention(user_id, user_name)
@@ -795,51 +824,65 @@ async def return_product_from_cart(
     product_id: int,
     only_one_unit: bool = False,
 ) -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT c.qty, p.title FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ? AND c.product_id = ?",
-        (user_id, product_id),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return None
-    qty, title = row
-    sku = format_sku(product_id)
-    if only_one_unit and qty > 1:
-        remove_qty = 1
+    lock = get_product_lock(product_id)
+    async with lock:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
         cur.execute(
-            "UPDATE cart_items SET qty = qty - 1 WHERE user_id = ? AND product_id = ?",
+            "SELECT c.qty, p.title, p.total_qty FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ? AND c.product_id = ?",
             (user_id, product_id),
         )
-    else:
-        remove_qty = qty
-        cur.execute("DELETE FROM cart_items WHERE user_id = ? AND product_id = ?", (user_id, product_id))
-    cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (remove_qty, product_id))
-    conn.commit()
-    conn.close()
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return None
+        qty, title, total_qty = row
+        sku = format_sku(product_id)
+        if only_one_unit and qty > 1:
+            remove_qty = 1
+            cur.execute(
+                "UPDATE cart_items SET qty = qty - 1 WHERE user_id = ? AND product_id = ?",
+                (user_id, product_id),
+            )
+        else:
+            remove_qty = qty
+            cur.execute("DELETE FROM cart_items WHERE user_id = ? AND product_id = ?", (user_id, product_id))
+        cur.execute("SELECT COALESCE(SUM(qty), 0) FROM cart_items WHERE product_id = ?", (product_id,))
+        rem_in_carts = int(cur.fetchone()[0] or 0)
+        max_allowed_avail = max(0, int(total_qty or 1) - rem_in_carts)
+        cur.execute(
+            "UPDATE products SET available_qty = MIN(?, available_qty + ?) WHERE id = ?",
+            (max_allowed_avail, remove_qty, product_id),
+        )
+        conn.commit()
+        conn.close()
 
-    await sync_channel_product_post(bot, product_id)
-    return f"Товар «{title}» ({sku}, {remove_qty} шт.) убран из корзины и возвращён в канал."
+        await sync_channel_product_post(bot, product_id)
+        return f"Товар «{title}» ({sku}, {remove_qty} шт.) убран из корзины и возвращён в канал."
 
 
 async def clear_user_cart_with_return(bot: MaxBotClient, user_id: int) -> List[str]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT c.product_id, c.qty, p.title FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ?",
+        "SELECT c.product_id, c.qty, p.title, p.total_qty FROM cart_items c JOIN products p ON p.id = c.product_id WHERE c.user_id = ?",
         (user_id,),
     )
     rows = cur.fetchall()
     cur.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
-    for pid, qty, _ in rows:
-        cur.execute("UPDATE products SET available_qty = available_qty + ? WHERE id = ?", (qty, pid))
+    for pid, qty, _, total_qty in rows:
+        cur.execute("SELECT COALESCE(SUM(qty), 0) FROM cart_items WHERE product_id = ?", (pid,))
+        rem_in_carts = int(cur.fetchone()[0] or 0)
+        max_allowed_avail = max(0, int(total_qty or 1) - rem_in_carts)
+        cur.execute(
+            "UPDATE products SET available_qty = MIN(?, available_qty + ?) WHERE id = ?",
+            (max_allowed_avail, qty, pid),
+        )
     conn.commit()
     conn.close()
 
     restored_list = []
-    for pid, qty, title in rows:
+    for pid, qty, title, _ in rows:
         await sync_channel_product_post(bot, pid)
         restored_list.append(f"{title} ({qty} шт.)")
     return restored_list
@@ -1184,35 +1227,37 @@ async def resolve_product_from_callback(
     cur = conn.cursor()
 
     # 1. Ищем товар по точному channel_message_id (mid поста в канале)
-    cur.execute("SELECT id, title, available_qty FROM products WHERE channel_message_id = ?", (mid,))
+    cur.execute("SELECT id FROM products WHERE channel_message_id = ?", (mid,))
     row_by_mid = cur.fetchone()
     if row_by_mid:
-        db_id, db_title, db_avail = row_by_mid
-        if db_avail <= 0 and parsed["has_book_btn"] and parsed["avail_qty"] > 0:
-            cur.execute("SELECT SUM(qty) FROM cart_items WHERE product_id = ?", (db_id,))
-            in_carts = cur.fetchone()[0] or 0
-            if in_carts == 0:
-                cur.execute("UPDATE products SET available_qty = ? WHERE id = ?", (parsed["avail_qty"], db_id))
-                conn.commit()
+        db_id = int(row_by_mid[0])
         conn.close()
-        return int(db_id)
+        return db_id
 
     # 2. Проверяем товар по pid из кнопки: совпадает ли название с постом в канале?
+    # ВАЖНО: никогда не увеличиваем available_qty здесь, иначе уже забронированный товар (available_qty=0) воскреснет!
     cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE id = ?", (pid,))
     row_by_id = cur.fetchone()
     if row_by_id:
         db_id, db_title, db_avail, db_mid = row_by_id
-        if (db_title or "").strip().lower() == post_title.strip().lower():
-            cur.execute(
-                "UPDATE products SET channel_message_id = ?, available_qty = CASE WHEN available_qty <= 0 THEN ? ELSE available_qty END WHERE id = ?",
-                (mid, parsed["avail_qty"], db_id),
-            )
-            conn.commit()
+        if _norm_title_key(db_title or "") == _norm_title_key(post_title):
+            if db_avail > 0 and not db_mid:
+                cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, db_id))
+                conn.commit()
             conn.close()
             return int(db_id)
 
-    # 3. Если pid в БД занят другим товаром (например «Ботинки р.36» вместо «Джемпер мужской р.М») или не существует —
-    # автоматически регистрируем настоящий товар прямо из поста канала!
+    # 2б. Проверяем, есть ли уже в БД товар с таким же названием и ценой (чтобы не задваивать при старых кэшированных постах)
+    cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE price = ? ORDER BY id DESC", (parsed["price"],))
+    for cand_id, cand_title, cand_avail, cand_mid in cur.fetchall():
+        if _norm_title_key(cand_title or "") == _norm_title_key(post_title):
+            if cand_avail > 0 and not cand_mid:
+                cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, cand_id))
+                conn.commit()
+            conn.close()
+            return int(cand_id)
+
+    # 3. Только если товара вообще нет в БД — регистрируем из поста канала
     cur.execute(
         """
         INSERT INTO products (title, price, total_qty, available_qty, photo_payload, channel_chat_id, channel_message_id, is_active, created_at)
@@ -1274,15 +1319,26 @@ async def sync_channel_history_on_startup(bot: MaxBotClient, ch_id: int) -> None
 
             btn_pid = p["btn_pid"]
             if btn_pid:
-                cur.execute("SELECT id, title, channel_message_id FROM products WHERE id = ?", (btn_pid,))
+                cur.execute("SELECT id, title, available_qty, channel_message_id FROM products WHERE id = ?", (btn_pid,))
                 by_id = cur.fetchone()
-                if by_id and (by_id[1] or "").strip().lower() == p["title"].strip().lower():
-                    cur.execute(
-                        "UPDATE products SET channel_message_id = ?, available_qty = CASE WHEN available_qty <= 0 THEN ? ELSE available_qty END WHERE id = ?",
-                        (mid, p["avail_qty"], btn_pid),
-                    )
-                    conn.commit()
+                if by_id and _norm_title_key(by_id[1] or "") == _norm_title_key(p["title"]):
+                    if by_id[2] > 0:
+                        cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, btn_pid))
+                        conn.commit()
                     continue
+
+            # Проверяем по названию и цене, чтобы не создавать дубликат уже известного товара
+            cur.execute("SELECT id, title, available_qty FROM products WHERE price = ? ORDER BY id DESC", (p["price"],))
+            matched_existing = None
+            for cid, ctitle, cavail in cur.fetchall():
+                if _norm_title_key(ctitle or "") == _norm_title_key(p["title"]):
+                    matched_existing = (cid, cavail)
+                    break
+            if matched_existing:
+                if matched_existing[1] > 0:
+                    cur.execute("UPDATE products SET channel_message_id = ? WHERE id = ?", (mid, matched_existing[0]))
+                    conn.commit()
+                continue
 
             cur.execute(
                 """
@@ -3234,10 +3290,43 @@ async def main() -> None:
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
     logger.info(
-        "Запущена версия v17: авто-объединение всех прошлых корзин из истории чата + защита БД при обновлении из Git + синхронизация постов канала"
+        "Запущена версия v18: защита от задвоения товаров при возвратах/двойном клике + кнопка «🛒 Забронировать» без «1 шт.»"
     )
     await sync_channel_history_on_startup(bot, int(ch_id))
     await reconstruct_carts_from_admin_dialog_history(bot)
+
+    # Авто-исправление задвоенных количеств в корзинах (когда qty в корзине превысил total_qty товара)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE cart_items
+            SET qty = (SELECT MAX(1, p.total_qty) FROM products p WHERE p.id = cart_items.product_id)
+            WHERE EXISTS (
+                SELECT 1 FROM products p
+                WHERE p.id = cart_items.product_id AND p.total_qty > 0 AND cart_items.qty > p.total_qty
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Ошибка авто-коррекции задвоенных корзин v18: {e}")
+
+    # Обновляем активные посты в канале (кнопка «🛒 Забронировать» без «1 шт.»)
+    if get_setting("notified_v18_clean_btn", "0") != "1":
+        set_setting("notified_v18_clean_btn", "1")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM products WHERE is_active = 1 AND available_qty > 0 AND channel_message_id IS NOT NULL")
+        active_pids = [r[0] for r in cur.fetchall()]
+        conn.close()
+        for pid in active_pids:
+            try:
+                await sync_channel_product_post(bot, pid)
+            except Exception as e:
+                logger.warning(f"Не удалось обновить кнопку поста #{pid}: {e}")
 
     # Обновляем активные посты в канале с кнопками быстрого выбора 1/2/3/5/10 шт.
     if get_setting("notified_v13_multi_qty_buttons", "0") != "1":
