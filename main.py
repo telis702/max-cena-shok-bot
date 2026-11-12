@@ -319,20 +319,39 @@ class MaxBotClient:
             return None
         url = f"{MAX_API_BASE}{path}"
         req_params = dict(params or {})
-        try:
-            async with self.session.request(method, url, params=req_params, json=json_body, timeout=35) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logger.warning(f"MAX API {method} {path} HTTP {resp.status}: {text}")
-                    return None
-                return json.loads(text) if text else {}
-        except asyncio.TimeoutError:
-            if path != "/updates":
-                logger.warning(f"Таймаут запроса MAX API {method} {path}")
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка запроса MAX API {method} {path}: {e}")
-            return None
+        is_poll = path == "/updates"
+        req_timeout = 28 if is_poll else 15
+        max_attempts = 1 if is_poll else 3
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.session.request(
+                    method, url, params=req_params, json=json_body, timeout=req_timeout
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status >= 500 and attempt < max_attempts:
+                        logger.warning(f"MAX API {method} {path} HTTP {resp.status} (попытка {attempt}/{max_attempts}), повтор...")
+                        await asyncio.sleep(1.5 * attempt)
+                        continue
+                    if resp.status >= 400:
+                        logger.warning(f"MAX API {method} {path} HTTP {resp.status}: {text[:200]}")
+                        return None
+                    return json.loads(text) if text else {}
+            except asyncio.TimeoutError:
+                if not is_poll:
+                    logger.warning(f"Таймаут сервера MAX API {method} {path} (попытка {attempt}/{max_attempts})")
+                    if attempt < max_attempts:
+                        await asyncio.sleep(1.5 * attempt)
+                        continue
+                return None
+            except Exception as e:
+                if not is_poll and attempt < max_attempts:
+                    logger.warning(f"Сбой связи MAX API {method} {path} ({e}), повтор {attempt}/{max_attempts}...")
+                    await asyncio.sleep(1.5 * attempt)
+                    continue
+                logger.error(f"Ошибка запроса MAX API {method} {path}: {e}")
+                return None
+        return None
 
     async def send_message(
         self,
@@ -3550,10 +3569,10 @@ async def publish_new_product_from_admin(
 
 
 async def webhook_guard_loop(bot: MaxBotClient) -> None:
-    """Каждые 20 секунд проверяет и удаляет сторонние вебхуки (например botman.pro), чтобы они не перехватывали кнопки."""
+    """Каждые 90 секунд в фоне проверяет и удаляет сторонние вебхуки, не блокируя основной цикл получения сообщений."""
     while True:
         try:
-            await asyncio.sleep(20)
+            await asyncio.sleep(90)
             await bot.clear_webhooks()
         except asyncio.CancelledError:
             break
@@ -3585,7 +3604,7 @@ async def main() -> None:
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
     logger.info(
-        "Запущена версия v19: полная синхронизация всех корзин (до 25 000 сообщений без обрезки на 1500) + точный учёт частичных удалений и статусов"
+        "Запущена версия v20: защита от лагов серверов MAX API (авто-повтор отправки сообщений + неблокирующий Long Polling)"
     )
     await sync_channel_history_on_startup(bot, int(ch_id))
     await reconstruct_carts_from_admin_dialog_history(bot)
@@ -3607,14 +3626,14 @@ async def main() -> None:
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.warning(f"Ошибка авто-коррекции задвоенных корзин v19: {e}")
+        logger.warning(f"Ошибка авто-коррекции задвоенных корзин v20: {e}")
 
     if get_setting("notified_v19_ready", "0") != "1":
         set_setting("notified_v19_ready", "1")
         try:
             await show_admin_menu(bot, 24725732)
         except Exception as e:
-            logger.warning(f"Не удалось отправить обновлённое меню v19: {e}")
+            logger.warning(f"Не удалось отправить обновлённое меню v20: {e}")
 
     guard_task = asyncio.create_task(webhook_guard_loop(bot))
     expire_task = asyncio.create_task(auto_expire_carts_loop(bot))
@@ -3624,7 +3643,7 @@ async def main() -> None:
     try:
         while True:
             params: Dict[str, Any] = {
-                "timeout": 25,
+                "timeout": 20,
                 "types": "message_created,message_callback,bot_started,bot_added",
             }
             if marker is not None:
@@ -3634,16 +3653,13 @@ async def main() -> None:
                 if "marker" in resp and resp["marker"] is not None:
                     marker = resp["marker"]
                 updates_list = resp.get("updates", [])
-                if not updates_list:
-                    await bot.clear_webhooks()
                 for upd in updates_list:
                     try:
                         await process_update(bot, upd)
                     except Exception as e:
                         logger.exception(f"Ошибка обработки события: {e}")
             else:
-                await bot.clear_webhooks()
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
     finally:
         guard_task.cancel()
         expire_task.cancel()
