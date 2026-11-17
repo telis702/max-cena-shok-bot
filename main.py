@@ -28,9 +28,9 @@ import os
 import re
 import shutil
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from dotenv import load_dotenv
@@ -971,12 +971,84 @@ async def expire_old_carts(bot: MaxBotClient) -> None:
 # =====================================================================
 # АДМИН-ПАНЕЛЬ
 # =====================================================================
+_RU_MONTHS = (
+    ("янв", 1),
+    ("фев", 2),
+    ("мар", 3),
+    ("апр", 4),
+    ("май", 5),
+    ("мая", 5),
+    ("мае", 5),
+    ("июн", 6),
+    ("июл", 7),
+    ("авг", 8),
+    ("сен", 9),
+    ("окт", 10),
+    ("ноя", 11),
+    ("дек", 12),
+)
+
+
+def _extract_calendar_date(label: str, today_d: date) -> Optional[date]:
+    s = (label or "").strip().lower()
+    if not s:
+        return None
+
+    m_dot = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b", s)
+    if m_dot:
+        day_i = int(m_dot.group(1))
+        mon_i = int(m_dot.group(2))
+        yr_raw = m_dot.group(3)
+        if yr_raw:
+            yr_i = int(yr_raw) if len(yr_raw) == 4 else 2000 + int(yr_raw)
+        else:
+            yr_i = today_d.year
+            if today_d.month == 12 and mon_i == 1:
+                yr_i += 1
+            elif today_d.month == 1 and mon_i == 12:
+                yr_i -= 1
+        try:
+            return date(yr_i, mon_i, day_i)
+        except ValueError:
+            return None
+
+    m_ru = re.search(r"\b(\d{1,2})\s+([а-яё]+)", s)
+    if m_ru:
+        day_i = int(m_ru.group(1))
+        mon_word = m_ru.group(2)
+        mon_i = next((m_num for pref, m_num in _RU_MONTHS if mon_word.startswith(pref)), 0)
+        if mon_i:
+            yr_i = today_d.year
+            if today_d.month == 12 and mon_i == 1:
+                yr_i += 1
+            elif today_d.month == 1 and mon_i == 12:
+                yr_i -= 1
+            try:
+                return date(yr_i, mon_i, day_i)
+            except ValueError:
+                return None
+
+    return None
+
+
 def get_open_delivery_dates() -> List[str]:
     raw = get_setting("delivery_dates", "").strip()
     if not raw or raw in ("0", "нет", "-"):
         return []
     parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
-    return parts[:8]
+    # Самара (UTC+4): прошедшие календарные дни скрываются автоматически, чтобы покупатели не записывались на вчерашнюю дату
+    today_samara = (datetime.now(timezone.utc) + timedelta(hours=4)).date()
+    actual_parts: List[str] = []
+    changed = False
+    for p in parts:
+        parsed_d = _extract_calendar_date(p, today_samara)
+        if parsed_d is not None and parsed_d < today_samara:
+            changed = True
+            continue
+        actual_parts.append(p)
+    if changed:
+        set_setting("delivery_dates", ", ".join(actual_parts))
+    return actual_parts[:8]
 
 
 async def show_admin_menu(bot: MaxBotClient, user_id: int) -> None:
@@ -3604,7 +3676,7 @@ async def main() -> None:
     ch_id = await bot.detect_channel_id()
     logger.info(f"Активный канал Цена ШОК: chat_id={ch_id}")
     logger.info(
-        "Запущена версия v20: защита от лагов серверов MAX API (авто-повтор отправки сообщений + неблокирующий Long Polling)"
+        "Запущена версия v21: авто-скрытие прошедших дат доставки + защита от лагов MAX API + полная синхронизация истории до 25 000 сообщений"
     )
     await sync_channel_history_on_startup(bot, int(ch_id))
     await reconstruct_carts_from_admin_dialog_history(bot)
